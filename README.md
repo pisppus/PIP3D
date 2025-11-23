@@ -1,6 +1,8 @@
-# PIP3D Camera System API
+# PIP3D Engine API
 
-This document describes the camera subsystem defined in `lib/Pip3D/core/pip3D_camera.h`.
+## Camera System
+
+This section describes the camera subsystem defined in `lib/Pip3D/core/pip3D_camera.h`.
 
 The camera is designed for real‑time 3D rendering on ESP32‑S3 without PSRAM and follows industry‑standard concepts similar to Unreal Engine and other modern engines.
 
@@ -425,4 +427,3 @@ Use `CameraBuilder` when you want to create and configure a camera in a single, 
 - Utility functions in `pip3D_camera_utils.h` provide quick setup helpers (`CameraHelper`, `MultiCameraHelper`) built on top of this API.
 
 When writing your own systems, prefer using the public `Camera` methods (`setPerspective`, `setOrtho`, `move*`, `rotate*`, `markDirty`) instead of manually editing internal cache fields. This keeps behavior predictable and aligned with the rest of the engine.
-
