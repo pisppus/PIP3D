@@ -306,6 +306,113 @@ Typical high-level usage is through `Renderer`:
 
 ---
 
+## FrameBuffer
+
+```cpp
+class FrameBuffer
+{
+public:
+    FrameBuffer();
+
+    bool init(const DisplayConfig& cfg, ST7789Display* display);
+
+    void beginFrame();
+    void endFrame();
+    void endFrameRegion(int16_t x, int16_t y, int16_t w, int16_t h);
+
+    uint16_t*       getBuffer();
+    const uint16_t* getBuffer() const;
+    const DisplayConfig& getConfig() const;
+
+    void     setSkyboxEnabled(bool enabled);
+    void     setSkyboxType(SkyboxType type);
+    void     setClearColor(Color color);
+
+    Skybox&       getSkybox();
+    const Skybox& getSkybox() const;
+    bool          isSkyboxEnabled() const;
+};
+```
+
+### Overview
+
+- **Purpose**
+  - Owns the main RGB565 back buffer for the 3D renderer.
+  - Bridges high-level rendering code and the low-level `ST7789Display::pushImage`.
+  - Implements skybox/clear logic and provides a raw pointer for rasterizers and HUD.
+
+- **Lifetime**
+  - Typically embedded as a member of `Renderer`.
+  - `Renderer::init` creates a single `ST7789Display` and passes it to `FrameBuffer::init`.
+  - The framebuffer allocates a single DMA-capable `width * height` buffer and frees it in its destructor.
+
+### Initialization and configuration
+
+- `bool init(const DisplayConfig& cfg, ST7789Display* display)`
+  - Allocates an aligned RGB565 buffer of size `cfg.width * cfg.height`.
+  - Uses PSRAM (`MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA`) when available, otherwise internal DMA-capable RAM.
+  - Returns `false` if called more than once on the same instance or when allocation fails.
+  - Stores `cfg` and the display pointer for later presentation.
+
+- `const DisplayConfig& getConfig() const`
+  - Returns the configuration used for buffer allocation.
+  - Width/height define the layout of the raw framebuffer pointer.
+
+- `uint16_t* getBuffer()` / `const uint16_t* getBuffer() const`
+  - Provides direct access to the backing RGB565 buffer.
+  - Used by rasterizers, shadow renderer, HUD renderer and FX systems.
+  - Returns `nullptr` when `init` has not succeeded.
+
+### Frame lifecycle
+
+- `void beginFrame()`
+  - Early-out when the buffer is not allocated.
+  - If the skybox is enabled (`isSkyboxEnabled()` and `Skybox::enabled`):
+    - Fills the entire buffer with a vertical gradient computed by `Skybox::getColorAtY`.
+    - Applies a subtle per-line dithering pattern to reduce banding.
+  - Otherwise clears the buffer uniformly to the current clear color using a 32-bit optimized path.
+
+- `void endFrame()`
+  - If the buffer or display pointer is null, does nothing.
+  - Uploads the entire framebuffer to the display via `ST7789Display::pushImage(0, 0, width, height, buffer)`.
+  - Used by `DirtyRegionHelper` when a full-screen refresh is more efficient than partial updates.
+
+- `void endFrameRegion(int16_t x, int16_t y, int16_t w, int16_t h)`
+  - If the buffer or display pointer is null, does nothing.
+  - Requests a partial upload of the rectangle `(x, y, w, h)` from the main buffer.
+  - Coordinates are in framebuffer space; clipping and bounds checks are handled by `ST7789Display::pushImage`.
+  - Called by `DirtyRegionHelper::finalizeFrame` for dirty rectangles and HUD regions.
+
+### Skybox and clear color control
+
+- `void setSkyboxEnabled(bool enabled)`
+  - Toggles usage of the skybox gradient during `beginFrame()`.
+  - When disabled, `beginFrame()` uses the solid clear color instead.
+
+- `void setSkyboxType(SkyboxType type)`
+  - Forwards to `Skybox::setPreset`.
+  - Does not automatically change lighting; use `Renderer::setSkyboxWithLighting` for coupled sky/lighting changes.
+
+- `Skybox& getSkybox()` / `const Skybox& getSkybox() const`
+  - Provides direct access to the underlying `Skybox` instance for fine-grained customization.
+  - Common uses: tweaking horizon/ground colors, enabling/disabling the skybox at runtime.
+
+- `bool isSkyboxEnabled() const`
+  - Returns the high-level flag controlling whether `beginFrame()` draws the skybox gradient or a flat clear.
+
+- `void setClearColor(Color color)`
+  - Sets the color used by the fast clear path when the skybox is disabled.
+  - The color is stored as RGB565 and used directly by `fastClear()`.
+
+Typical high-level usage is through `Renderer`:
+
+- `setSkyboxEnabled(bool)`
+- `setSkyboxType(SkyboxType)`
+- `setSkyboxWithLighting(SkyboxType)`
+- `Skybox& getSkybox()`
+
+---
+
 ## PerformanceCounter (PerfCounter)
 
 ```cpp
@@ -1288,10 +1395,6 @@ using Frustum = CameraFrustum;
     - smoothly interpolated in between when intersecting the frustum.
   - Can drive fade‑in/out, particle density, or other quality scaling near frustum edges.
 
-- **getPlane(i)**
-  - Provides read‑only access to individual planes (`NEAR`, `FAR`, etc.).
-  - Intended for advanced effects (e.g. custom clipping, debugging visualizations).
-
 ### Typical usage
 
 - High‑level rendering:
@@ -1305,6 +1408,1121 @@ using Frustum = CameraFrustum;
 
 All frustum operations are designed to be allocation‑free and fast under `-O3` with
 `-ffast-math` on ESP32‑S3.
+
+---
+
+## Dirty Regions and Partial Frame Updates (DirtyRegionHelper)
+
+```cpp
+static constexpr int MAX_WORLD_DIRTY_INSTANCES = 32;
+
+struct WorldInstanceDirtySlot
+{
+    MeshInstance* instance;
+    int16_t       curMinX, curMinY, curMaxX, curMaxY;
+    int16_t       lastMinX, lastMinY, lastMaxX, lastMaxY;
+    bool          hasCurrent;
+    bool          hasLast;
+};
+
+class DirtyRegionHelper
+{
+public:
+    static void addDirtyRect(MeshInstance* instance,
+                             int16_t x, int16_t y, int16_t w, int16_t h,
+                             const Viewport& viewport,
+                             WorldInstanceDirtySlot worldInstanceDirty[MAX_WORLD_DIRTY_INSTANCES],
+                             int16_t& worldDirtyMinX,
+                             int16_t& worldDirtyMinY,
+                             int16_t& worldDirtyMaxX,
+                             int16_t& worldDirtyMaxY,
+                             bool& hasWorldDirtyRegion);
+
+    static void addHudDirtyRect(int16_t x, int16_t y, int16_t w, int16_t h,
+                                const Viewport& viewport,
+                                int16_t& hudDirtyMinX,
+                                int16_t& hudDirtyMinY,
+                                int16_t& hudDirtyMaxX,
+                                int16_t& hudDirtyMaxY,
+                                bool& hasHudDirtyRegion);
+
+    static void finalizeFrame(FrameBuffer& framebuffer,
+                              PerformanceCounter& perfCounter,
+                              WorldInstanceDirtySlot worldInstanceDirty[MAX_WORLD_DIRTY_INSTANCES],
+                              int16_t& worldDirtyMinX,
+                              int16_t& worldDirtyMinY,
+                              int16_t& worldDirtyMaxX,
+                              int16_t& worldDirtyMaxY,
+                              int16_t& lastWorldDirtyMinX,
+                              int16_t& lastWorldDirtyMinY,
+                              int16_t& lastWorldDirtyMaxX,
+                              int16_t& lastWorldDirtyMaxY,
+                              bool& hasWorldDirtyRegion,
+                              bool& hasLastWorldDirtyRegion,
+                              int16_t& hudDirtyMinX,
+                              int16_t& hudDirtyMinY,
+                              int16_t& hudDirtyMaxX,
+                              int16_t& hudDirtyMaxY,
+                              bool& hasHudDirtyRegion,
+                              bool cameraChangedThisFrame,
+                              uint32_t statsTrianglesTotal,
+                              uint32_t statsTrianglesBackfaceCulled,
+                              uint32_t statsInstancesTotal,
+                              uint32_t statsInstancesFrustumCulled,
+                              uint32_t statsInstancesOcclusionCulled);
+};
+```
+
+### Overview
+
+- **Purpose**
+  - Tracks screen‑space regions that changed this frame and performs partial buffer
+    uploads instead of full‑screen refreshes.
+  - Designed for ESP32‑S3 + ST7789 where SPI bandwidth is the main bottleneck.
+  - Used internally by `Renderer` together with `FrameBuffer` and `Viewport`.
+
+- **High‑level behavior**
+  - Each moving `MeshInstance` owns a `WorldInstanceDirtySlot` storing its previous and
+    current dirty rectangle in framebuffer coordinates.
+  - Between frames, dirty rectangles are merged and compared against the total
+    framebuffer area.
+  - If dirty coverage is small, only the affected regions are pushed to the display.
+  - If coverage grows beyond a threshold (≈70% of the screen) or the camera changes,
+    the system falls back to a full‑screen refresh.
+
+Typical user code does not call `DirtyRegionHelper` directly; it is driven from
+`Renderer::drawMeshInstance*` and HUD helpers. Advanced users can interact with it
+via custom render paths if needed.
+
+### MAX_WORLD_DIRTY_INSTANCES
+
+- **Value**: `32`.
+- **Meaning**
+  - Upper bound on the number of world‑space instances tracked individually for
+    per‑object dirty rectangles.
+  - Additional instances fall back to a single aggregated world dirty region, which
+    is still used for partial updates, but without per‑instance separation.
+
+Choose this constant based on your typical number of dynamic objects. Increasing it
+trades a little more RAM in the renderer for potentially finer dirty tracking.
+
+### WorldInstanceDirtySlot
+
+- **Fields**
+  - `MeshInstance* instance`
+    - Pointer to the tracked instance or `nullptr` when the slot is free.
+  - `curMinX, curMinY, curMaxX, curMaxY`
+    - Current frame dirty rectangle in inclusive‑exclusive form `[min, max)` in
+      framebuffer coordinates.
+  - `lastMinX, lastMinY, lastMaxX, lastMaxY`
+    - Same rectangle for the previous frame.
+  - `hasCurrent`, `hasLast`
+    - Flags indicating whether the corresponding rectangle is valid.
+
+Slots are maintained by `addDirtyRect` and `finalizeFrame`. Application code should
+treat them as an internal implementation detail of the renderer.
+
+### DirtyRegionHelper::addDirtyRect
+
+- **Signature**
+  - See declaration above.
+
+- **Behavior**
+  - Clips the input rectangle `(x, y, w, h)` to the active `Viewport`.
+  - If `instance == nullptr`, expands the global world dirty region
+    (`worldDirtyMin*`/`worldDirtyMax*`).
+  - Otherwise:
+    - Searches for an existing slot for `instance` or allocates a free one.
+    - If no free slot is available, falls back to expanding the global world dirty
+      region instead of losing information.
+    - Merges the new rectangle into `cur*` of the instance’s slot.
+
+`Renderer` calls this indirectly from its internal `addDirtyFromSphere` helper,
+which approximates a 3D bounding sphere as a 2D screen‑space rectangle.
+
+### DirtyRegionHelper::addHudDirtyRect
+
+- **Purpose**
+  - Tracks 2D HUD/UI dirty regions separately from world geometry.
+  - Used by helpers like `Renderer::drawText` to keep HUD updates efficient.
+
+- **Behavior**
+  - Clips `(x, y, w, h)` to the viewport.
+  - Initializes or expands the single HUD dirty rectangle
+    (`hudDirtyMin*`/`hudDirtyMax*`).
+  - Ignores fully off‑screen rectangles.
+
+HUD dirt is stored separately so that UI changes alone can trigger partial refreshes
+even when the 3D world is static.
+
+### DirtyRegionHelper::finalizeFrame
+
+- **Purpose**
+  - Computes the minimal set of screen rectangles that must be sent to the display at
+    the end of the frame.
+  - Chooses between full‑frame and partial updates based on dirty coverage.
+  - Updates performance counters and periodically prints frame statistics.
+
+- **Inputs**
+  - `framebuffer`
+    - Provides size (`DisplayConfig`) and the backing RGB565 buffer.
+  - `perfCounter`
+    - Receives `endFrame()` call after the upload path is chosen.
+  - `worldInstanceDirty[]`
+    - Array of per‑instance slots for moving meshes.
+  - World / last world dirty bounds and flags
+    - Pairs of min/max coordinates for aggregated regions and corresponding
+      `hasWorldDirtyRegion` / `hasLastWorldDirtyRegion` flags.
+  - HUD dirty bounds and flag
+    - Single rectangle and `hasHudDirtyRegion`.
+  - `cameraChangedThisFrame`
+    - When `true`, forces a full‑screen refresh (camera movement invalidates all
+      previous dirty tracking).
+  - Statistics counters (`statsTriangles*`, `statsInstances*`)
+    - Used only for periodic debug prints; do not affect dirty logic.
+
+- **Algorithm (simplified)**
+  - If the camera changed or there are no world/HUD dirty regions at all, perform a
+    full‑screen refresh and reset all slots.
+  - For each `WorldInstanceDirtySlot`:
+    - Build a rectangle that covers both current and last positions when needed.
+    - Discard degenerate rectangles (`width <= 0` or `height <= 0`).
+    - Append to a temporary list and roll current → last for the next frame.
+  - Fold aggregated world dirty regions into the list as one extra rectangle.
+  - Optionally compute a HUD rectangle and its area.
+  - If there is still no world or HUD dirt, perform a full‑screen refresh.
+  - Iteratively merge overlapping world rectangles into a smaller set.
+  - Compute `worldArea` as the sum of merged rectangle areas and `combinedArea` as
+    `worldArea + hudArea`.
+  - If `combinedArea` exceeds about 70% of the full framebuffer area, fall back to a
+    full‑screen refresh.
+  - Otherwise call `FrameBuffer::endFrameRegion` for each merged world rectangle and,
+    if present, for the HUD rectangle, then finish with `perfCounter.endFrame()`.
+
+This approach is entirely allocation‑free, uses only fixed‑size arrays on the stack
+and is safe for long‑running real‑time rendering on ESP32‑S3 without PSRAM.
+
+---
+
+## Z-Buffer and Dithering (ZBuffer, BAYER_MATRIX_4X4)
+
+Z-buffer and ordered dithering are defined in `lib/Pip3D/rendering/display/pip3D_zbuffer.h`
+and used throughout the renderer, rasterizer and shadow system.
+
+```cpp
+namespace pip3D
+{
+    static constexpr float BAYER_MATRIX_4X4[4][4];
+
+    template <uint16_t WIDTH, uint16_t HEIGHT>
+    class ZBuffer
+    {
+    public:
+        ZBuffer();
+        ZBuffer(const ZBuffer&) = delete;
+        ZBuffer& operator=(const ZBuffer&) = delete;
+
+        bool     init();
+        void     clear();
+
+        bool     testAndSet(uint16_t x, uint16_t y, float z);
+        bool     hasGeometry(uint16_t x, uint16_t y) const;
+        bool     hasShadow(uint16_t x, uint16_t y) const;
+        void     markShadow(uint16_t x, uint16_t y);
+
+        void     testAndSetScanline(uint16_t y,
+                                    uint16_t x_start,
+                                    uint16_t x_end,
+                                    float    z_start,
+                                    float    z_step,
+                                    uint16_t* frameBuffer,
+                                    uint16_t  color);
+    };
+}
+```
+
+### BAYER_MATRIX_4X4
+
+- **Purpose**
+  - 4×4 Bayer matrix used for ordered dithering when converting HDR lighting
+    results to 16-bit RGB565 output.
+  - Accessed by `Shading::applyDithering` and indirectly by all triangle
+    rasterization paths.
+
+- **Layout**
+  - Normalized values in `[0, 1)` pre-divided by `16.0f`:
+    - Covers the standard Bayer pattern for 4×4 tiles.
+  - Indexed as `BAYER_MATRIX_4X4[y & 3][x & 3]` for any integer pixel
+    coordinates.
+
+Typical users do not access this matrix directly; it is part of the
+internal shading pipeline.
+
+### ZBuffer<WIDTH, HEIGHT>
+
+- **Purpose**
+  - Per-pixel depth buffer with integrated shadow-mask bit used by the
+    software rasterizer, culling and shadow renderer.
+  - Stores one 16-bit value per pixel for a fixed resolution determined by
+    the template parameters `WIDTH` and `HEIGHT`.
+
+- **Internal layout (high level)**
+  - Each pixel is a 16-bit signed value:
+    - Lower 15 bits store the depth in a fixed-point range based on
+      `0 .. MAX_DEPTH`.
+    - The top bit is a **shadow flag** used to mark pixels that already
+      received a shadow contribution.
+  - The exact bit layout is an implementation detail but is stable across
+    the engine and used consistently by all consumers.
+
+- **Construction and lifetime**
+  - `ZBuffer()`
+    - Default-constructs an empty buffer with `buffer == nullptr`.
+    - Does not allocate memory by itself.
+  - `ZBuffer(const ZBuffer&) = delete`, `operator= = delete`
+    - Z-buffer instances are non-copyable to avoid accidental sharing of the
+      underlying memory.
+
+- **bool init()**
+  - Allocates an internal `WIDTH * HEIGHT` array of 16-bit values.
+  - On boards with PSRAM, uses `ps_malloc`; otherwise falls back to the
+    regular `malloc` heap.
+  - Safe to call multiple times:
+    - Any previous buffer is freed before a new one is allocated.
+  - On success, immediately clears the buffer to the far depth value.
+  - Returns `true` on success and `false` when allocation fails.
+  - Marked with `[[nodiscard]]` (via `__attribute__((warn_unused_result))`)
+    to encourage callers to check for allocation failures.
+
+- **void clear()**
+  - Fills the entire buffer with a special "clear" depth value representing
+    empty space and no geometry.
+  - Called at the start of each frame by `Renderer::beginFrame`.
+  - Safe to call when the buffer is not yet allocated (no-op in that case).
+
+- **bool testAndSet(x, y, z)**
+  - Per-pixel depth test used during triangle rasterization.
+  - Inputs:
+    - `x, y` – pixel coordinates in framebuffer space.
+    - `z` – depth value in the same range used by the projection
+      matrices (typically `0..1` after perspective divide).
+  - Behavior:
+    - If `(x, y)` lies outside `[0, WIDTH) × [0, HEIGHT)`, returns `false`
+      and leaves the buffer unchanged.
+    - Converts `z` to a 16-bit fixed-point depth and compares it with the
+      currently stored depth at `(x, y)` (ignoring the shadow flag).
+    - If the new depth is **closer**, updates the depth at `(x, y)` while
+      preserving any existing shadow flag and returns `true`.
+    - Otherwise returns `false` and leaves the buffer as is.
+  - Used heavily by `Rasterizer::fillTriangle*` and similar routines.
+
+- **bool hasGeometry(x, y) const**
+  - Returns `true` when the pixel at `(x, y)` contains any geometry (i.e. its
+    depth is different from the cleared far value).
+  - Returns `false` when out of bounds, the buffer is not allocated or the
+    pixel is still in the cleared state.
+  - Used primarily by the occlusion culling system
+    (`Culling::isInstanceOccluded`).
+
+- **bool hasShadow(x, y) const**
+  - Checks whether the shadow flag is set for pixel `(x, y)`.
+  - Returns `false` when out of bounds or when the buffer is not allocated.
+  - Used by the shadow renderer to avoid over-applying shadows on the same
+    pixel.
+
+- **void markShadow(x, y)**
+  - Sets the shadow flag for pixel `(x, y)` while keeping the stored depth
+    unchanged.
+  - Does nothing when out of bounds or when the buffer is not allocated.
+  - Called by `Rasterizer::fillShadowTriangle` once a shadow contribution has
+    been blended into the framebuffer.
+
+- **void testAndSetScanline(y, x_start, x_end, z_start, z_step, frameBuffer, color)**
+  - Optimized scanline version of `testAndSet` used for flat-colored
+    triangles.
+  - Inputs:
+    - `y` – scanline index in framebuffer coordinates.
+    - `x_start, x_end` – inclusive horizontal bounds of the scanline segment.
+    - `z_start` – depth at `x_start`.
+    - `z_step` – per-pixel depth increment along X.
+    - `frameBuffer` – pointer to the RGB565 framebuffer.
+    - `color` – 16-bit RGB565 color to write when a pixel passes the depth
+      test.
+  - Behavior:
+    - Clips `x_start`/`x_end` to `[0, WIDTH)` and early-exits when the
+      scanline is outside the buffer.
+    - Iterates across the scanline, maintaining a fixed-point depth value.
+    - For each pixel that is closer than the stored depth, updates the
+      z-buffer (preserving any existing shadow flag) and writes `color` to
+      the corresponding entry in `frameBuffer`.
+    - The inner loop is unrolled in groups of four pixels for better
+      performance on ESP32-S3.
+  - Used by `Rasterizer::fillTriangle` for solid-colored geometry.
+
+The renderer owns a single `ZBuffer<320, 240>` instance associated with the main
+`FrameBuffer`. Application code normally does not interact with `ZBuffer`
+directly; instead, it drives high-level rendering APIs (meshes, instances,
+shadows) and lets the engine keep the depth buffer consistent.
+
+---
+
+## Rasterizer (Triangle Rasterization)
+
+The low-level triangle rasterizer is defined in
+`lib/Pip3D/rendering/raster/pip3D_rasterizer.h` and is used by
+`MeshRenderer` and `ShadowRenderer` to convert projected triangles into
+RGB565 pixels inside the main framebuffer.
+
+```cpp
+class Rasterizer
+{
+public:
+    static void fillShadowTriangle(int16_t x0, int16_t y0,
+                                    int16_t x1, int16_t y1,
+                                    int16_t x2, int16_t y2,
+                                    uint16_t shadowColor,
+                                    uint8_t alpha,
+                                    uint16_t* frameBuffer,
+                                    ZBuffer<320, 240>* zBuffer,
+                                    const DisplayConfig& config,
+                                    bool softEdges = true);
+
+    static void fillTriangleSmooth(int16_t x0, int16_t y0, float z0,
+                                    int16_t x1, int16_t y1, float z1,
+                                    int16_t x2, int16_t y2, float z2,
+                                    float r0, float g0, float b0,
+                                    float r1, float g1, float b1,
+                                    float r2, float g2, float b2,
+                                    uint16_t* frameBuffer,
+                                    ZBuffer<320, 240>* zBuffer,
+                                    const DisplayConfig& config);
+
+    static void fillTriangle(int16_t x0, int16_t y0, float z0,
+                              int16_t x1, int16_t y1, float z1,
+                              int16_t x2, int16_t y2, float z2,
+                              uint16_t color,
+                              uint16_t* frameBuffer,
+                              ZBuffer<320, 240>* zBuffer,
+                              const DisplayConfig& config);
+};
+```
+
+### Overview
+
+- **Purpose**
+  - Converts already projected triangles (screen-space X/Y, depth `z`) into
+    RGB565 pixels in the main framebuffer.
+  - Performs per-pixel depth testing against `ZBuffer<320, 240>`.
+  - Provides three specialized paths:
+    - planar shadow overlay (`fillShadowTriangle`),
+    - Gouraud-shaded triangles with per-vertex colors (`fillTriangleSmooth`),
+    - solid-colored triangles (`fillTriangle`).
+
+-- **Inputs**
+  - Geometry triangles (`fillTriangleSmooth`, `fillTriangle`):
+    - `x0,y0,z0` .. `x2,y2,z2` – vertices in **screen space** after projection.
+    - `x` and `y` are in framebuffer pixel coordinates.
+    - `z` is the depth value used for z-buffer comparisons (typically `0..1`).
+  - Shadow triangles (`fillShadowTriangle`):
+    - `x0,y0` .. `x2,y2` – projected shadow hull in screen space.
+    - Depth comes from existing geometry in `ZBuffer`; the function does not
+      accept or modify `z` explicitly.
+  - `frameBuffer`
+    - Pointer to the main RGB565 framebuffer owned by `FrameBuffer`.
+  - `zBuffer`
+    - Pointer to the engine-wide `ZBuffer<320, 240>` instance.
+  - `config`
+    - Display resolution; only `width`/`height` are used here.
+
+- **Safety**
+  - All functions early-out when `frameBuffer == nullptr` or `zBuffer == nullptr`.
+  - Y-coordinates are clipped to `[0, height)` per scanline.
+  - X-coordinates are clipped to `[0, width)` before any framebuffer access.
+  - Triangles that are fully degenerate in Y or X are skipped.
+
+- **Usage pattern**
+  - Application code normally does **not** call `Rasterizer` directly.
+  - Use high-level APIs instead:
+    - `MeshRenderer::drawMesh` / `drawTriangle3D*` for lit geometry.
+    - `ShadowRenderer::drawMeshShadow` / `drawMeshInstanceShadow` for planar shadows.
+  - Direct calls are possible for custom low-level effects (debug overlays,
+    procedural geometry) when you already have projected vertices and access
+    to the engine framebuffer and z-buffer.
+
+### fillShadowTriangle
+
+- **Purpose**
+  - Applies a single planar shadow contribution over existing geometry.
+  - Used exclusively by `ShadowRenderer` after the lit geometry pass.
+
+- **Color and alpha**
+  - `shadowColor`
+    - Base RGB565 color of the shadow, usually pre-darkened by
+      `ShadowRenderer` based on `ShadowSettings::shadowOpacity`.
+  - `alpha`
+    - 8-bit opacity in `[0, 255]` controlling how strongly the shadow
+      darkens the background.
+  - When `softEdges` is `true`, edge pixels use a reduced effective
+    alpha to create a soft penumbra around the shadow hull.
+
+- **Depth and masking**
+  - The function does **not** modify the z-buffer values themselves.
+  - Per-pixel conditions:
+    - Skips pixels where `ZBuffer::hasGeometry(x, y) == false` (no
+      geometry to receive a shadow).
+    - Skips pixels where `ZBuffer::hasShadow(x, y) == true` to avoid
+      double-darkening the same pixel.
+    - Marks each affected pixel via `ZBuffer::markShadow(x, y)` after
+      blending.
+
+- **Blending model**
+  - Background and shadow colors are expressed in RGB565 (R5 G6 B5) and
+    blended per channel using the 8-bit `alpha` value.
+  - Result is written back into `frameBuffer` while preserving the depth
+    stored in the z-buffer.
+
+### fillTriangleSmooth
+
+- **Purpose**
+  - Rasterizes a triangle with **per-vertex RGB colors** (Gouraud
+    shading).
+  - Used by `MeshRenderer::drawTriangle3DSmooth` for smoothly lit meshes.
+
+- **Color inputs**
+  - `r0,g0,b0` .. `r2,g2,b2`
+    - Linear RGB components in `[0, 1]` computed by the lighting system.
+    - Interpolated across the triangle in screen space.
+  - For each pixel that passes the depth test, the interpolated color is
+    converted to RGB565 via `Shading::applyDithering` (which also applies a
+    small ordered dithering pattern using `BAYER_MATRIX_4X4`).
+
+- **Depth handling**
+  - Uses `ZBuffer::testAndSet(x, y, z)` per pixel:
+    - Rejects pixels behind existing geometry.
+    - Updates depth for closer pixels while preserving the shadow flag.
+
+- **Performance notes**
+  - All interpolation work is done with 32-bit floats, which are efficiently
+    supported by ESP32-S3's FPU.
+  - The function is fully inline-able and allocation-free; it operates only
+    on stack variables and external buffers.
+
+### fillTriangle
+
+- **Purpose**
+  - Rasterizes a **solid-colored** triangle.
+  - Used by `MeshRenderer::drawTriangle3D` when per-vertex shading is not
+    required.
+
+- **Color input**
+  - `color`
+    - RGB565 value applied uniformly to every pixel that passes the depth
+      test.
+
+- **Depth handling**
+  - Uses the optimized scanline helper
+    `ZBuffer<320, 240>::testAndSetScanline(...)` for each affected
+    horizontal span.
+  - This minimizes per-pixel branching and leverages small unrolled inner
+    loops for ESP32-S3.
+
+---
+
+## Shading (Lighting and Tone Mapping)
+
+```cpp
+class Shading
+{
+public:
+    static constexpr float AMBIENT_LIGHT;
+    static constexpr float DIFFUSE_STRENGTH;
+    static constexpr float SPECULAR_STRENGTH;
+    static constexpr float RIM_STRENGTH;
+    static constexpr float HDR_EXPOSURE;
+    static constexpr float DIFFUSE_WRAP;
+    static constexpr float CONTRAST;
+    static constexpr float SATURATION;
+
+    static void calculateLighting(
+        const Vector3& fragPos,
+        const Vector3& normal,
+        const Vector3& viewDir,
+        const Light*   lights,
+        int            lightCount,
+        float          baseR, float baseG, float baseB,
+        float&         outR,  float& outG,  float& outB);
+
+    static uint16_t applyDithering(float r, float g, float b,
+                                   int16_t x, int16_t y);
+};
+```
+
+### Overview
+
+- **Purpose**
+  - Implements per-fragment lighting, rim lighting, tone mapping and simple
+    color grading for all lit geometry.
+  - Designed for ESP32-S3 without PSRAM: fully static, allocation-free and
+    heavily inlined.
+  - Consumes world-space fragment data and the engine `Light` array and
+    produces linear RGB values in `[0, 1]` which are later converted to
+    RGB565.
+
+- **Coordinate space and inputs**
+  - `fragPos`
+    - World-space position of the shaded point (triangle centroid or vertex).
+  - `normal`
+    - Normalized world-space surface normal used for diffuse/specular/rim
+      terms.
+  - `viewDir`
+    - Normalized direction from the fragment towards the active camera.
+  - `lights`, `lightCount`
+    - Pointer to a contiguous array of `Light` structs and the number of
+      active lights to process (`[0, lightCount)`).
+  - `baseR`, `baseG`, `baseB`
+    - Base linear RGB albedo in `[0, 1]`, typically decoded from a mesh
+      color (`Color::rgb565`) or material.
+
+- **Lighting model (high level)**
+  - Hemispherical ambient
+    - Uses `AMBIENT_LIGHT` scaled by a hemisphere factor derived from
+      `normal.y` so that upward-facing surfaces are slightly brighter than
+      downward-facing ones.
+  - Wrapped diffuse
+    - Uses a modified Lambert term with `DIFFUSE_WRAP` to soften the
+      lighting terminator and avoid hard bands, similar to wrap lighting in
+      larger engines.
+  - Blinn-Phong specular
+    - Computes a half-vector between `lightDir` and `viewDir` and raises
+      `max(dot(normal, halfway), 0)` to a high power via repeated squaring
+      to approximate a tight highlight.
+    - `SPECULAR_STRENGTH` controls the overall intensity of the specular
+      lobe.
+  - Rim lighting
+    - Adds a view-dependent highlight based on
+      `1 - dot(normal, viewDir)` squared, scaled by `RIM_STRENGTH`, to
+      emphasize silhouettes.
+
+- **Tone mapping and color grading**
+  - HDR tone mapping
+    - Applies a simple Reinhard-style curve per channel using
+      `HDR_EXPOSURE`: `c = c * exposure / (1 + c * exposure)`.
+  - Gamma correction
+    - Uses `sqrtf` per channel as an inexpensive approximation of gamma
+      ≈ 2.0.
+  - Saturation
+    - Computes luma (`0.299 * R + 0.587 * G + 0.114 * B`) and blends
+      between luma and the original color using `SATURATION`.
+  - Contrast
+    - Recenters around 0.5 and applies `CONTRAST` as a simple linear
+      contrast control.
+  - Final clamp
+    - Uses `clamp` to keep all outputs in `[0, 1]` before RGB565
+      conversion.
+
+### calculateLighting(...)
+
+- **Signature**
+  - `static void calculateLighting(const Vector3& fragPos,`
+  - `                              const Vector3& normal,`
+  - `                              const Vector3& viewDir,`
+  - `                              const Light*   lights,`
+  - `                              int            lightCount,`
+  - `                              float          baseR, float baseG, float baseB,`
+  - `                              float&         outR,  float& outG,  float& outB);`
+
+- **Behavior**
+  - Initializes `outR/G/B` with hemispherical ambient.
+  - Iterates over `[0, lightCount)`:
+    - Directional lights
+      - Use the negated, normalized `Light::direction` as `lightDir`.
+    - Point lights
+      - Use `(light.position - fragPos)` and `Light::range` for
+        attenuation.
+      - Compute distance squared once and:
+        - Skip fragments outside the range.
+        - Normalize `lightDir` via `FastMath::fastInvSqrt` when
+          distance is non-zero.
+        - Compute a smooth falloff `1 / (1 + (d / range)^2)`.
+    - Uses `Light::getCachedRGB` to fetch light color in `[0, 1]`.
+    - Accumulates diffuse and specular contributions into `outR/G/B` in
+      linear space.
+  - Adds rim lighting, then applies tone mapping, gamma, saturation,
+    contrast and clamp.
+
+- **Performance notes**
+  - Marked `always_inline, hot` and implemented in the header for maximal
+    inlining in hot rasterization paths.
+  - Uses squared distances and `FastMath::fastInvSqrt` to avoid redundant
+    `sqrtf` calls in the point light path.
+  - Contains no dynamic allocations or persistent state; safe for
+    long-running use on ESP32-S3 without PSRAM.
+
+### applyDithering(...)
+
+- **Signature**
+  - `static uint16_t applyDithering(float r, float g, float b,`
+  - `                               int16_t x, int16_t y);`
+
+- **Inputs**
+  - `r, g, b`
+    - Linear RGB components in `[0, 1]` after lighting and tone mapping.
+  - `x, y`
+    - Integer pixel coordinates in framebuffer space.
+
+- **Behavior**
+  - Converts `r, g, b` to the native RGB565 ranges (R5 G6 B5).
+  - Looks up a small ordered-dithering offset from `BAYER_MATRIX_4X4`
+    using `x & 3` and `y & 3` as indices.
+  - Applies a tiny, channel-specific offset before rounding and clamps to
+    the legal 5/6-bit ranges.
+  - Packs the result into a single `uint16_t` in RGB565 format.
+  - Used by `Rasterizer::fillTriangleSmooth` and by flat-shaded paths
+    when they already have linear RGB values.
+
+## Math Utilities (FastMath, Vector3, Matrix4x4, Quaternion)
+
+This section describes the core math types defined in `lib/Pip3D/math/pip3D_math.h`.
+
+They are used pervasively across the engine (camera, meshes, physics, culling) and are
+designed to be small, inline‑friendly and efficient on ESP32‑S3 without PSRAM.
+
+### Coordinate system and units
+
+- Right‑handed world with **Y up**, **X right**, **Z forward** (into the screen).
+- Distances and positions are expressed in arbitrary **world units** (meters‑like).
+- Angles:
+  - Low‑level math (`FastMath`, `Quaternion::fromEuler`) uses **radians**.
+  - High‑level APIs (camera FOV, `Matrix4x4::setRotationX/Y/Z`, `MeshInstance::setEuler`)
+    accept **degrees** and internally convert via `DEG2RAD`.
+
+### FastMath
+
+```cpp
+class FastMath
+{
+public:
+    static float fastSin(float angleRad);
+    static float fastCos(float angleRad);
+    static float fastInvSqrt(float x);
+};
+```
+
+- **Purpose**
+  - Provides fast approximations for sine, cosine and inverse square root.
+  - Backed by small lookup tables (256 entries) and the classic Quake III `1/sqrt(x)`
+    algorithm with two Newton iterations.
+
+- **fastSin(angleRad) / fastCos(angleRad)**
+  - Input is an angle in **radians**.
+  - Internally normalizes the angle to `[0, 2π)` and samples the lookup table.
+  - Suitable for animation, procedural geometry and camera motion where a small
+    approximation error is acceptable.
+
+- **fastInvSqrt(x)**
+  - Returns an approximation of `1 / sqrt(x)` for positive `x`.
+  - Used internally by `Vector3::normalize` and `Quaternion::normalize`.
+  - Prefer this over repeated `sqrtf` calls when normalizing many vectors.
+
+Typical usage:
+
+```cpp
+float angle = timeSeconds * 2.0f;      // radians
+float s     = FastMath::fastSin(angle);
+float c     = FastMath::fastCos(angle);
+Vector3 dir = Vector3(c, 0.0f, s);     // unit circle in XZ plane
+```
+
+---
+
+### Vector3
+
+```cpp
+struct Vector3
+{
+    float x, y, z;
+
+    constexpr Vector3();
+    constexpr Vector3(float x, float y, float z);
+
+    Vector3  operator+(const Vector3& v) const;
+    Vector3  operator-(const Vector3& v) const;
+    Vector3  operator*(float s) const;
+    Vector3& operator+=(const Vector3& v);
+    Vector3& operator-=(const Vector3& v);
+    Vector3& operator*=(float s);
+
+    void     normalize();
+    float    length() const;
+    float    lengthSquared() const;
+    float    dot(const Vector3& v) const;
+    Vector3  cross(const Vector3& v) const;
+};
+```
+
+- **Purpose**
+  - Fundamental 3D vector type for positions, directions and normals.
+  - Used everywhere: camera properties, mesh vertices, physics primitives, frustum, etc.
+
+- **Arithmetic operators**
+  - Standard component‑wise addition/subtraction and scalar multiplication.
+  - Compound operators (`+=`, `-=`, `*=`) modify in place and return `*this`.
+
+- **length() / lengthSquared()**
+  - `lengthSquared()` avoids the square root and is preferred for comparisons
+    (`distA2 < distB2`).
+  - `length()` returns `0` for very small vectors to avoid numerical noise.
+
+- **normalize()**
+  - Normalizes the vector in place using `FastMath::fastInvSqrt`.
+  - Does nothing when length is almost zero.
+
+- **dot(v) / cross(v)**
+  - `dot` returns the scalar product, used for angles, projections and backface tests.
+  - `cross` returns a vector perpendicular to both inputs (right‑handed).
+
+Typical usage:
+
+```cpp
+Vector3 up(0.0f, 1.0f, 0.0f);
+Vector3 forward(0.0f, 0.0f, 1.0f);
+Vector3 right = forward.cross(up);   // (1, 0, 0)
+
+Vector3 velocity = forward * 3.0f;   // move at 3 units/sec along +Z
+```
+
+---
+
+### Matrix4x4
+
+```cpp
+struct Matrix4x4
+{
+    float m[16];
+
+    Matrix4x4();
+
+    void      identity();
+    Matrix4x4 operator*(const Matrix4x4& b) const;
+
+    Vector3   transform(const Vector3& v) const;     // with perspective divide
+    Vector3   transformNoDiv(const Vector3& v) const;
+    Vector3   transformNormal(const Vector3& n) const;
+
+    void      setPerspective(float fovDeg, float aspect,
+                             float nearPlane, float farPlane);
+    void      setOrthographic(float left, float right,
+                              float bottom, float top,
+                              float nearPlane, float farPlane);
+
+    void      lookAt(const Vector3& eye,
+                     const Vector3& target,
+                     const Vector3& up);
+
+    void      setTranslation(float x, float y, float z);
+    void      setRotationX(float angleDeg);
+    void      setRotationY(float angleDeg);
+    void      setRotationZ(float angleDeg);
+    void      setScale(float x, float y, float z);
+};
+```
+
+- **Storage and layout**
+  - 4×4 float matrix, 16‑byte aligned.
+  - Layout matches the rest of the engine and is compatible with camera/view/projection
+    matrices.
+
+- **identity() / operator***
+  - `identity()` resets the matrix to an identity transform.
+  - Multiplication composes two transforms (`result = this * b`).
+
+- **transform(v)**
+  - Applies the full 4×4 transform to a position, including translation and
+    perspective divide (`w` component).
+  - Used by the renderer to convert world‑space vertices into clip/screen space.
+
+- **transformNoDiv(v)**
+  - Applies the affine part only (no divide by `w`).
+  - Used for world‑space operations like transforming bounding sphere centers.
+
+- **transformNormal(n)**
+  - Transforms a direction vector by the upper‑left 3×3 submatrix and renormalizes.
+  - Use this for normals instead of `transform()` to avoid translation.
+
+- **setPerspective(fovDeg, aspect, nearPlane, farPlane)**
+  - Builds a standard perspective projection matrix.
+  - `fovDeg` is in **degrees**; other parameters are positive distances.
+
+- **setOrthographic(left, right, bottom, top, nearPlane, farPlane)**
+  - Builds an orthographic projection volume.
+  - Used by the camera for orthographic views.
+
+- **lookAt(eye, target, up)**
+  - Builds a right‑handed view matrix from camera `eye`, `target` and `up` vectors.
+
+Typical usage (manual camera matrix):
+
+```cpp
+Matrix4x4 view, proj, vp;
+view.lookAt(cameraPos, cameraTarget, Vector3(0, 1, 0));
+proj.setPerspective(60.0f, aspect, 0.1f, 100.0f);
+vp = proj * view;
+```
+
+---
+
+### Quaternion
+
+```cpp
+struct Quaternion
+{
+    float x, y, z, w;
+
+    Quaternion();
+    Quaternion(float x, float y, float z, float w);
+
+    static Quaternion fromAxisAngle(const Vector3& axis, float angleRad);
+    static Quaternion fromEuler(float pitchRad, float yawRad, float rollRad);
+
+    Quaternion conjugate() const;
+    void       normalize();
+
+    Quaternion operator*(const Quaternion& q) const;
+
+    Vector3    rotate(const Vector3& v) const;
+    void       toMatrix(Matrix4x4& out) const;
+
+    static Quaternion slerp(const Quaternion& a,
+                            const Quaternion& b,
+                            float t);
+};
+```
+
+- **Purpose**
+  - Compact rotation representation with no gimbal lock and smooth interpolation.
+  - Used by `MeshInstance` for world‑space rotation and by camera utilities.
+
+- **fromAxisAngle(axis, angleRad)**
+  - Constructs a rotation around a normalized axis by `angleRad` radians.
+
+- **fromEuler(pitchRad, yawRad, rollRad)**
+  - Builds a quaternion from Euler angles in **radians**.
+  - High‑level APIs like `MeshInstance::setEuler` accept degrees and convert before
+    calling this function.
+
+- **conjugate() / normalize()**
+  - `conjugate` flips the vector part and leaves `w` unchanged (inverse for unit
+    quaternions).
+  - `normalize` rescales `(x, y, z, w)` to unit length using `FastMath::fastInvSqrt`.
+
+- **operator*(q)**
+  - Composes two rotations (`this` then `q`).
+  - Commonly used for incremental rotation updates.
+
+- **rotate(v)**
+  - Rotates a vector by the quaternion, returning the transformed direction.
+
+- **toMatrix(out)**
+  - Writes the equivalent 3×3 rotation into the upper‑left part of `out`.
+  - Used by instance transforms and camera matrices.
+
+- **slerp(a, b, t)**
+  - Spherical linear interpolation between rotations `a` and `b`.
+  - Handles the shortest‑arc path automatically and falls back to linear interpolation
+    when `a` and `b` are nearly identical.
+  - `t` is in `[0, 1]`.
+
+Typical usage (instance rotation):
+
+```cpp
+Quaternion start = Quaternion::fromAxisAngle(Vector3(0, 1, 0), 0.0f);
+Quaternion end   = Quaternion::fromAxisAngle(Vector3(0, 1, 0), PI);
+
+float t = 0.5f; // halfway
+Quaternion mid = Quaternion::slerp(start, end, t);
+
+Matrix4x4 rotM;
+mid.toMatrix(rotM);
+```
+
+---
+
+## Collision Primitives (AABB, CollisionSphere, Ray, CollisionPlane)
+
+These low-level collision and intersection helpers are defined in
+`lib/Pip3D/math/pip3D_collision.h`. They are used by the physics system and can also be
+used directly in gameplay code for custom collision queries.
+
+---
+
+### AABB
+
+```cpp
+struct AABB
+{
+    Vector3 min, max;
+
+    AABB();
+    AABB(const Vector3& mn, const Vector3& mx);
+
+    static AABB fromCenterSize(const Vector3& center, const Vector3& size);
+
+    Vector3 center() const;
+    Vector3 size() const;
+
+    bool    contains(const Vector3& point) const;
+    bool    intersects(const AABB& other) const;
+
+    void    expand(const Vector3& point);
+    void    merge(const AABB& other);
+};
+```
+
+- **Purpose**
+  - Axis-aligned bounding box in world space.
+  - Used by `RigidBody` in the physics system for broad-phase overlap tests and by
+    higher-level systems that need simple spatial bounds.
+
+- **min, max**
+  - World-space corners of the box.
+  - `min` holds the smallest components, `max` the largest.
+
+- **fromCenterSize(center, size)**
+  - Builds an AABB from a center point and full extents.
+  - Equivalent to `min = center - size * 0.5f`, `max = center + size * 0.5f`.
+
+- **center() / size()**
+  - Convenience accessors returning the box center and extents.
+
+- **contains(point)**
+  - Returns `true` if the point lies inside or on the box (inclusive checks).
+
+- **intersects(other)**
+  - Fast AABB–AABB overlap test; returns `true` when intervals overlap on all axes.
+
+- **expand(point)**
+  - Grows the box so that it also contains `point`.
+  - Useful when building bounds from a stream of positions.
+
+- **merge(other)**
+  - Expands this box to contain `other` as well.
+  - Can be used to accumulate world bounds of multiple objects.
+
+---
+
+### CollisionSphere
+
+```cpp
+struct CollisionSphere
+{
+    Vector3 center;
+    float   radius;
+
+    CollisionSphere();
+    CollisionSphere(const Vector3& c, float r);
+
+    bool contains(const Vector3& point) const;
+    bool intersects(const CollisionSphere& other) const;
+    bool intersects(const AABB& box) const;
+};
+```
+
+- **Purpose**
+  - Simple bounding sphere primitive used by physics and culling code.
+  - Ideal for cheap radial checks and broad-phase tests.
+
+- **center, radius**
+  - World-space center and radius of the sphere.
+
+- **contains(point)**
+  - Returns `true` if the point is inside or on the sphere (squared-distance check).
+
+- **intersects(other)**
+  - Sphere–sphere overlap test using squared distances.
+
+- **intersects(box)**
+  - Sphere–AABB overlap test: clamps the center to the box and compares squared distance
+    to `radius^2`.
+
+---
+
+### Ray
+
+```cpp
+struct Ray
+{
+    Vector3 origin;
+    Vector3 direction;
+
+    Ray();
+    Ray(const Vector3& o, const Vector3& d);
+
+    Vector3 at(float t) const;
+
+    bool intersects(const AABB& box, float& tMin, float& tMax) const;
+    bool intersects(const CollisionSphere& sphere, float& t) const;
+};
+```
+
+- **Purpose**
+  - Parametric ray `origin + direction * t` used for continuous collision checks.
+  - Physics uses it internally for swept sphere–sphere and sphere–box tests.
+
+- **origin, direction**
+  - World-space ray origin and direction (not required to be normalized).
+
+- **at(t)**
+  - Evaluates the point along the ray at parameter `t`.
+
+- **intersects(box, tMin, tMax)**
+  - Ray–AABB intersection using the standard slab method.
+  - On success, writes the entering (`tMin`) and exiting (`tMax`) parameters along the ray
+    and returns `true`.
+  - Works with non-normalized directions; `t` is measured in units of the ray parameter
+    such that `origin + direction * t` is the hit point.
+
+- **intersects(sphere, t)**
+  - Ray–sphere intersection based on the quadratic solution.
+  - Returns the nearest non-negative intersection parameter in `t` when a hit occurs.
+  - If the ray origin lies inside the sphere and the direction is effectively zero-length,
+    the function reports a hit with `t = 0`.
+
+---
+
+### CollisionPlane
+
+```cpp
+struct CollisionPlane
+{
+    Vector3 normal;
+    float   distance;
+
+    CollisionPlane();
+    CollisionPlane(const Vector3& n, float d);
+    CollisionPlane(const Vector3& n, const Vector3& point);
+
+    float distanceToPoint(const Vector3& point) const;
+    bool  intersects(const CollisionSphere& sphere) const;
+};
+```
+
+- **Purpose**
+  - General plane primitive for simple plane–point and plane–sphere tests.
+  - Suitable for ground planes, triggers and simple clipping volumes.
+
+- **normal, distance**
+  - `normal` is stored normalized.
+  - `distance` is the signed distance from the origin along `normal` to the plane
+    (in the equation `normal · p - distance = 0`).
+
+- **distanceToPoint(point)**
+  - Signed distance from `point` to the plane.
+  - Negative values mean the point lies behind the plane, positive in front.
+
+- **intersects(sphere)**
+  - Returns `true` if a sphere intersects or touches the plane.
+
+---
 
 ## Mesh Geometry (Mesh, Vertex, Face, PackedNormal)
 
@@ -1686,6 +2904,352 @@ public:
   - `color` – base color.
 
 Capsules are useful for player and NPC proxies, physics shapes and stylized props.
+
+---
+
+## Physics System (PhysicsMaterial, RigidBody, CollisionInfo, PhysicsWorld)
+
+The physics system provides a lightweight rigid body simulation suitable for ESP32-S3
+without PSRAM. It is defined in `lib/Pip3D/physics/pip3D_physics.h` and focuses on box
+and sphere shapes, fast broad-phase checks and an impulse-based contact solver.
+
+Physics is fully optional: you can construct and step `PhysicsWorld` manually, or
+integrate it with the job system to run simulation asynchronously on the second core.
+
+---
+
+### PhysicsMaterial
+
+```cpp
+struct PhysicsMaterial
+{
+    float friction;
+    float restitution;
+
+    PhysicsMaterial();
+    PhysicsMaterial(float f, float r);
+};
+```
+
+- **Purpose**
+  - Describes basic surface properties used during collision resolution.
+  - Combined per-contact via `min(friction)` and `min(restitution)` of the two bodies.
+
+- **friction**
+  - Dimensionless coefficient used for Coulomb-like friction limits.
+  - Typical values: `0.0f` (no friction) to `1.0f` (very sticky).
+
+- **restitution**
+  - Bounciness coefficient used in the normal impulse computation.
+  - `0.0f` – inelastic collisions; `1.0f` – perfectly elastic.
+
+- **Constructors**
+  - `PhysicsMaterial()`
+    - Initializes `friction = 0.5f`, `restitution = 0.5f`.
+  - `PhysicsMaterial(f, r)`
+    - Directly sets `friction` and `restitution`.
+
+Use `PhysicsMaterial` to quickly define materials for floors, walls, props or characters
+and apply them to rigid bodies via `RigidBody::setMaterial`.
+
+---
+
+### RigidBody
+
+```cpp
+enum BodyShape
+{
+    BODY_SHAPE_BOX   = 0,
+    BODY_SHAPE_SPHERE = 1
+};
+
+struct RigidBody
+{
+    Vector3   position;
+    Vector3   previousPosition;
+    Vector3   velocity;
+    Vector3   acceleration;
+    Vector3   angularVelocity;
+    Quaternion orientation;
+    Vector3   size;
+    float     mass;
+    float     invMass;
+    float     restitution;
+    float     friction;
+    bool      isStatic;
+    BodyShape shape;
+    float     radius;
+    Vector3   invInertia;
+    AABB      bounds;
+    bool      canSleep;
+    bool      isSleeping;
+    float     sleepTimer;
+
+    RigidBody();
+    RigidBody(const Vector3& pos, const Vector3& size, float m = 1.0f);
+
+    void setBox(const Vector3& newSize);
+    void setSphere(float r);
+
+    void applyForce(const Vector3& force);
+    void applyGravity(float gravityValue = -9.81f);
+
+    void update(float deltaTime);
+
+    void setPosition(const Vector3& pos);
+    void setStatic(bool s);
+    void wakeUp();
+    void setCanSleep(bool value);
+    void setMaterial(const PhysicsMaterial& m);
+
+    void updateBoundsFromTransform();
+};
+```
+
+#### Purpose and representation
+
+- **RigidBody**
+  - Simulated rigid body with position, orientation, linear and angular velocity.
+  - Supports two primitive body shapes:
+    - `BODY_SHAPE_BOX` – oriented box defined by `size` and `orientation`.
+    - `BODY_SHAPE_SPHERE` – sphere defined by `position` and `radius`.
+  - Stores an axis-aligned bounding box `bounds` used for broad-phase overlap tests.
+
+- **Mass and inertia**
+  - `mass` / `invMass`
+    - `mass > 0` enables dynamics; `mass <= 0` behaves as infinite mass.
+    - Internal `invMass` is derived from `mass` and used in impulse calculations.
+  - `invInertia`
+    - Approximate inverse inertia tensor stored as diagonal components `(ix, iy, iz)`.
+    - Computed automatically from `shape`, `size`, `mass` or `radius`.
+
+- **Sleeping**
+  - `canSleep`, `isSleeping`, `sleepTimer`
+    - Used by `PhysicsWorld` to skip integration for nearly static bodies.
+    - Sleeping bodies keep their transform but do not accumulate forces or move.
+
+#### Construction and shape setup
+
+- **RigidBody()**
+  - Creates a unit box at the origin with `mass = 1.0f`, `size = (1,1,1)`.
+  - Default material: `friction = 0.5f`, `restitution = 0.5f`.
+  - `isStatic = false`, `canSleep = true`.
+
+- **RigidBody(pos, size, m)**
+  - Initializes a box at `pos` with extents `size` and mass `m`.
+  - Automatically computes `invMass`, `invInertia` and `bounds`.
+
+- **setBox(newSize)**
+  - Configures the body as an oriented box with world-space size `newSize`.
+  - Updates `shape`, `size`, `bounds` and inertia.
+
+- **setSphere(r)**
+  - Configures the body as a sphere with radius `r`.
+  - Updates `shape`, `radius`, `size` (diameter on all axes), `bounds` and inertia.
+
+#### Forces, integration and transforms
+
+- **applyForce(force)**
+  - Adds a world-space force for the next integration step.
+  - Ignored for static bodies and for bodies with non-positive `mass`.
+
+- **applyGravity(gravityValue)**
+  - Adds a vertical acceleration `gravityValue` along the Y axis (default `-9.81f`).
+  - Typically called by `PhysicsWorld` to apply global gravity.
+
+- **update(deltaTime)**
+  - Integrates linear and angular motion over `deltaTime` seconds.
+  - Applies linear and angular damping, clamps maximum velocities and normalizes
+    orientation.
+  - Updates `position`, `orientation`, `bounds` and clears accumulated acceleration.
+  - Does nothing for static or sleeping bodies.
+
+- **setPosition(pos)**
+  - Sets world-space position, resets `previousPosition` and updates `bounds`.
+  - Wakes the body by clearing sleep state.
+
+- **setStatic(s)**
+  - Toggles `isStatic`.
+  - When set to `true`, resets velocities and acceleration, recomputes inertia and
+    disables dynamic motion.
+
+#### Sleeping and material control
+
+- **wakeUp()**
+  - Clears `isSleeping` and `sleepTimer` if the body is currently sleeping.
+
+- **setCanSleep(value)**
+  - Enables or disables automatic sleeping.
+  - When disabled, immediately wakes the body.
+
+- **setMaterial(m)**
+  - Copies `friction` and `restitution` from `m` into the body.
+
+- **updateBoundsFromTransform()**
+  - Rebuilds `bounds` from the current `position`, `orientation` and `size`.
+  - Used internally after integration and when changing transforms.
+
+Use `RigidBody` directly when you need fine-grained control over a few dynamic or
+static objects (player, enemies, moving platforms, simple props).
+
+---
+
+### CollisionInfo
+
+```cpp
+struct CollisionInfo
+{
+    bool      hasCollision;
+    Vector3   normal;
+    float     penetration;
+    Vector3   contactPoint;
+    RigidBody* bodyA;
+    RigidBody* bodyB;
+
+    CollisionInfo();
+};
+```
+
+- **Purpose**
+  - Describes a single contact between two rigid bodies.
+  - Used internally by `PhysicsWorld` and exposed for debugging or custom logic.
+
+- **Fields**
+  - `hasCollision`
+    - `true` when a valid contact exists; `false` for the default-initialized state.
+  - `normal`
+    - Contact normal pointing from `bodyA` towards `bodyB`.
+  - `penetration`
+    - Overlap depth along `normal` in world units.
+  - `contactPoint`
+    - Approximate world-space contact point between the two shapes.
+  - `bodyA`, `bodyB`
+    - Pointers to the rigid bodies involved in the contact.
+
+`CollisionInfo` instances are produced by the internal `detectCollision` method during
+the solver loop and then passed to `resolveCollision`.
+
+---
+
+### PhysicsWorld
+
+```cpp
+class PhysicsWorld
+{
+public:
+    PhysicsWorld();
+
+    bool  addBody(RigidBody* body);
+    void  removeBody(RigidBody* body);
+
+    void  setGravity(const Vector3& g);
+
+    void  setAsyncEnabled(bool enabled);
+    bool  isAsyncEnabled() const;
+    bool  isStepInProgress() const;
+
+    void  setFixedTimeStep(float dt);
+    float getFixedTimeStep() const;
+
+    void  updateFixed(float frameDelta);
+    void  stepAsync(float deltaTime);
+};
+```
+
+#### Purpose and responsibilities
+
+- **PhysicsWorld**
+  - Owns a list of `RigidBody*` and advances the simulation in fixed or variable
+    time steps.
+  - Applies global gravity, detects collisions and resolves contacts via an
+    impulse-based solver.
+  - Optionally uses `JobSystem` to execute simulation steps asynchronously on
+    the worker core.
+
+#### Body management
+
+- **addBody(body)**
+  - Registers `body` for simulation.
+  - Returns `false` if `body` is `nullptr`, `true` otherwise.
+  - Does not take ownership: the caller is responsible for allocating and
+    destroying the `RigidBody` instance and for removing it from the world
+    before destruction.
+
+- **removeBody(body)**
+  - Unregisters `body` in O(1) time by swapping with the last entry.
+  - Safe to call multiple times; does nothing if `body` is not found.
+
+#### Global parameters
+
+- **setGravity(g)**
+  - Sets the world gravity vector used during the next simulation steps.
+  - Default value is `(0, -9.81f, 0)`.
+
+- **setFixedTimeStep(dt)** / **getFixedTimeStep()**
+  - Controls the fixed update interval used by `updateFixed`.
+  - `dt <= 0` disables fixed stepping and makes `updateFixed` perform a single
+    variable-step update per call.
+
+#### Fixed-step update and async stepping
+
+- **updateFixed(frameDelta)**
+  - Preferred entry point for time integration from the main loop.
+  - Accumulates `frameDelta` and performs one or more simulation steps of duration
+    `getFixedTimeStep()` while keeping the accumulator clamped to a small multiple
+    of the step size.
+  - When async mode is enabled, schedules steps via `stepAsync`; otherwise runs
+    them synchronously on the calling thread.
+
+- **setAsyncEnabled(enabled)** / **isAsyncEnabled()**
+  - Controls whether physics steps may run on the job system.
+  - `isAsyncEnabled()` also checks `JobSystem::isEnabled()` to ensure that the
+    worker is available before taking the asynchronous path.
+
+- **isStepInProgress()**
+  - Returns `true` while an asynchronous step scheduled via `stepAsync` is still
+    running.
+  - Can be used by game code to avoid overlapping updates.
+
+- **stepAsync(deltaTime)**
+  - Schedules a single simulation step with duration `deltaTime`.
+  - When async mode or the job system is disabled, falls back to an immediate
+    synchronous call to the internal step function.
+  - When async mode is enabled and no other step is in progress, submits a job
+    to `JobSystem` and marks the world as busy until the job completes.
+
+##### Notes on thread-safety and lifetime
+
+- `PhysicsWorld` itself is not thread-safe:
+  - Do not call `addBody`, `removeBody` or destroy bodies referenced by the
+    world while an asynchronous step is in progress.
+  - Ensure that the world outlives any in-flight jobs scheduled via
+    `stepAsync` (for example by shutting down physics before application exit).
+
+#### Contact generation and resolution (internal behavior)
+
+Although not exposed as public methods, the following behaviors are important
+to understand simulation results:
+
+- **Collision detection**
+  - Uses `AABB::intersects` as a broad-phase filter.
+  - Supports sphere–sphere, sphere–box and box–box (OBB–OBB) contacts.
+  - Sphere–sphere and sphere–box contacts also include a simple continuous
+    collision detection path based on swept rays.
+
+- **Solver iterations**
+  - Uses a fixed number of solver iterations per step for resolving contacts.
+  - Each iteration loops over all body pairs and applies impulses when a
+    `CollisionInfo` reports an overlap.
+
+- **Sleeping and stabilization**
+  - Very slow-moving box bodies can be put to sleep to save CPU time.
+  - Additional stabilization logic gently snaps resting boxes to an upright
+    pose when they are already nearly aligned with the Y axis and close to the
+    ground.
+
+This physics system is designed for small to medium numbers of bodies (tens of
+objects) and simple shapes, prioritizing predictability and low RAM usage over
+complex features.
 
 ---
 
@@ -2072,3 +3636,405 @@ renderer.drawInstances(manager);
 This instance system is designed to be safe for continuous operation: pooling avoids
 frequent allocations, and explicit lifetime APIs let you control when memory is reused
 or released.
+
+---
+
+## Lighting and LightManager
+
+```cpp
+enum LightType
+{
+    LIGHT_DIRECTIONAL,
+    LIGHT_POINT
+};
+
+struct Light
+{
+    LightType type;
+    float     intensity;
+    Vector3   direction;
+    Vector3   position;
+    Color     color;
+    float     range;
+    mutable float cachedR, cachedG, cachedB;
+    mutable bool  colorCacheDirty;
+
+    void getCachedRGB(float& r, float& g, float& b) const;
+};
+
+class LightManager
+{
+public:
+    static void   setLight(std::vector<Light>& lights, int& activeLightCount, int index, const Light& light);
+    static int    addLight(std::vector<Light>& lights, int& activeLightCount, const Light& light);
+    static void   removeLight(std::vector<Light>& lights, int& activeLightCount, int index);
+    static Light* getLight(std::vector<Light>& lights, int activeLightCount, int index);
+    static void   clearLights(int& activeLightCount);
+    static int    getLightCount(int activeLightCount);
+
+    static void   setMainDirectionalLight(std::vector<Light>& lights, int& activeLightCount,
+                                          const Vector3& direction, const Color& color, float intensity = 1.0f);
+
+    static void   setMainPointLight(std::vector<Light>& lights, int& activeLightCount,
+                                    const Vector3& position, const Color& color,
+                                    float intensity = 1.0f, float range = 10.0f);
+
+    static void   setLightColor(std::vector<Light>& lights, int activeLightCount, const Color& color);
+    static void   setLightPosition(std::vector<Light>& lights, int activeLightCount, const Vector3& pos);
+    static void   setLightDirection(std::vector<Light>& lights, int activeLightCount, const Vector3& dir);
+    static void   setLightTemperature(std::vector<Light>& lights, int activeLightCount, float kelvin);
+    static Color  getLightColor(const std::vector<Light>& lights, int activeLightCount);
+    static void   setLightType(std::vector<Light>& lights, int activeLightCount, LightType type);
+};
+
+### Overview
+
+- **Purpose**
+  - Defines the runtime representation of lights (`Light`, `LightType`) and a
+    minimal array manager (`LightManager`) used internally by `Renderer`.
+  - Keeps a dense array of active lights with an explicit `activeLightCount`
+    instead of reallocating on every add/remove.
+  - Integrates with the shading pipeline (`Shading::calculateLighting`) and the
+    shadow renderer, which always iterate only over
+    `[0, activeLightCount)`.
+
+- **Main light vs additional lights**
+  - Slot `lights[0]` is treated as the **main light** (usually the sun).
+  - Helper methods that do not take an explicit index operate only on this
+    main light.
+  - Additional lights are managed via indexed operations and contribute to the
+    lighting of all shaded geometry.
+
+- **Typical high‑level usage**
+  - Application code usually talks to `Renderer`:
+    - `setMainDirectionalLight(direction, color, intensity)`
+    - `setMainPointLight(position, color, intensity, range)`
+    - `setLightColor(color)`, `setLightPosition(pos)`, `setLightDirection(dir)`,
+      `setLightTemperature(kelvin)`, `setLightType(type)`
+    - `setLight(index, light)`, `addLight(light)`, `removeLight(index)`,
+      `Light* getLight(index)`, `int getLightCount()`
+  - Internally, these methods forward to `LightManager` with the renderer‑owned
+    `std::vector<Light>` and `activeLightCount`.
+
+### Light and LightType
+
+- **LightType**
+  - `LIGHT_DIRECTIONAL`
+    - Parallel light from an infinite source (sun‑like).
+    - Direction taken from `Light::direction`; normalized by the engine when
+      configuring the main light.
+  - `LIGHT_POINT`
+    - Omnidirectional point light.
+    - Origin in `Light::position`, optional falloff controlled by `Light::range`.
+
+- **Light fields (runtime representation)**
+  - `type`
+    - One of `LightType` values; determines how the light is handled by
+      shading and shadow systems.
+  - `intensity`
+    - Unitless brightness multiplier tuned for ESP32‑S3 HDR tone‑mapping in
+      `Shading::calculateLighting`.
+  - `direction`
+    - Direction vector for directional lights.
+  - `position`
+    - World‑space origin for point lights.
+  - `color`
+    - Base color stored as `Color` (`rgb565` internally), consistent with the
+      rest of the engine.
+  - `range`
+    - Effective radius for point lights. When zero, the light has no
+      distance‑based falloff.
+  - `cachedR`, `cachedG`, `cachedB`
+    - Cached linearized RGB components in `[0, 1]` derived from `color.rgb565`.
+    - Updated lazily by `Light::getCachedRGB` to avoid repeated bit‑unpacking
+      inside the inner lighting loops.
+  - `colorCacheDirty`
+    - Marks whether the cached RGB components are out of date.
+    - Set by `LightManager` and other helpers whenever `color` changes.
+
+- **Light::getCachedRGB(r, g, b)**
+  - Decodes `color.rgb565` into normalized floats `r`, `g`, `b` in `[0, 1]`.
+  - Recomputes and stores the channels only when `colorCacheDirty` is `true`.
+  - Used heavily by `Shading::calculateLighting` and is marked `always_inline`
+    in the header to keep per‑pixel lighting as cheap as possible on ESP32‑S3.
+
+### LightManager API
+
+- **`setLight(lights, activeLightCount, index, light)`**
+  - Writes `light` into `lights[index]`, resizing the underlying vector when
+    `index` is beyond the current size.
+  - Marks the written light color cache as dirty so that `Light::getCachedRGB`
+    recomputes channels on next use.
+  - Updates `activeLightCount` so that it always covers the highest written
+    index.
+
+- **`addLight(lights, activeLightCount, light)`**
+  - Adds a new light at the end of the active range.
+  - Reuses existing storage when `activeLightCount < lights.size()`, otherwise
+    performs a single `push_back`.
+  - Marks the new light cache as dirty and returns its index, then increments
+    `activeLightCount`.
+
+- **`removeLight(lights, activeLightCount, index)`**
+  - Removes the light at `index` from the active range.
+  - When removing the last active light, simply decrements `activeLightCount`.
+  - Otherwise compacts lights by shifting `[index + 1, activeLightCount)` left
+    by one to keep the active range dense.
+
+- **`getLight(lights, activeLightCount, index)`**
+  - Returns a pointer to `lights[index]` if `index` lies inside
+    `[0, activeLightCount)`, otherwise returns `nullptr`.
+
+- **`clearLights(activeLightCount)` / `getLightCount(activeLightCount)`**
+  - `clearLights` sets `activeLightCount` to zero without touching the
+    underlying `std::vector<Light>`; capacity is preserved for reuse.
+  - `getLightCount` returns the number of currently active lights and is used
+    as the upper bound for all lighting/shadow loops.
+
+### Main light helpers
+
+- **`setMainDirectionalLight(lights, activeLightCount, direction, color, intensity)`**
+  - Ensures at least one active light, then configures `lights[0]` as a
+    directional light.
+  - Normalizes `direction` and sets `color` and `intensity`.
+  - Marks the color cache as dirty to reflect the new color.
+
+- **`setMainPointLight(lights, activeLightCount, position, color, intensity, range)`**
+  - Ensures at least one active light, then configures `lights[0]` as a point
+    light.
+  - Sets `position`, `color`, `intensity` and `range`, invalidating the color
+    cache.
+
+- **`setLightColor(lights, activeLightCount, color)`**
+  - Changes the color of the main light when at least one light is active and
+    the array is non‑empty.
+
+- **`setLightPosition(lights, activeLightCount, pos)` / `setLightDirection(lights, activeLightCount, dir)`**
+  - Update position and direction of the main light.
+  - For directions the vector is normalized to keep lighting stable.
+
+- **`setLightTemperature(lights, activeLightCount, kelvin)`**
+  - Converts color temperature in Kelvin to `Color` via `Color::fromTemperature`
+    and applies it to the main light.
+  - Used indirectly by `Renderer::setSkyboxWithLighting` to keep sky and sun
+  - color consistent.
+
+- **`getLightColor(lights, activeLightCount)`**
+  - Returns the color of the main light, or `Color::WHITE` when there are no
+    active lights or the light array is empty.
+
+- **`setLightType(lights, activeLightCount, type)`**
+  - Changes the `LightType` of the main light if at least one light is active
+    and the array is non‑empty.
+
+Together, `Light`, `LightType` and `LightManager` form the low‑level lighting API
+for the engine. Typical user code works with higher‑level `Renderer` helpers,
+while custom tools and advanced scenarios can access and manipulate light arrays
+directly when fine‑grained control is required.
+
+---
+
+## ShadowProjector, ShadowSettings and ShadowRenderer
+
+Planar shadows are implemented as a lightweight, GPU‑less system that projects
+geometry onto a configurable plane and blends a darkened footprint into the
+framebuffer. The public API is defined in
+`lib/Pip3D/rendering/lighting/pip3D_shadow.h` and
+`lib/Pip3D/rendering/lighting/pip3D_shadow_renderer.h`.
+
+```cpp
+class ShadowProjector
+{
+public:
+    struct ShadowPlane
+    {
+        Vector3 normal;  // Normalized plane normal
+        float   d;       // Plane offset in n.x*x + n.y*y + n.z*z + d = 0
+
+        ShadowPlane();
+        ShadowPlane(const Vector3& n, float distance);
+
+        static ShadowPlane fromPointAndNormal(const Vector3& point,
+                                              const Vector3& normal);
+    };
+};
+
+struct ShadowSettings
+{
+    bool       enabled;
+    Color      shadowColor;
+    float      shadowOpacity;
+    float      shadowOffset;
+    bool       softEdges;
+    ShadowProjector::ShadowPlane plane;
+
+    ShadowSettings();
+};
+
+class ShadowRenderer
+{
+public:
+    static void drawMeshShadow(Mesh* mesh,
+                               bool shadowsEnabled,
+                               const ShadowSettings& shadowSettings,
+                               const Camera& camera,
+                               const Light* lights,
+                               int activeLightCount,
+                               const Matrix4x4& viewProjMatrix,
+                               const Viewport& viewport,
+                               FrameBuffer& framebuffer,
+                               ZBuffer<320, 240>* zBuffer,
+                               bool& backfaceCullingEnabled);
+
+    static void drawMeshInstanceShadow(MeshInstance* instance,
+                                       bool shadowsEnabled,
+                                       const ShadowSettings& shadowSettings,
+                                       const Camera& camera,
+                                       const Light* lights,
+                                       int activeLightCount,
+                                       const Matrix4x4& viewProjMatrix,
+                                       const Viewport& viewport,
+                                       FrameBuffer& framebuffer,
+                                       ZBuffer<320, 240>* zBuffer,
+                                       bool& backfaceCullingEnabled);
+};
+
+### ShadowProjector and ShadowPlane
+
+- **Purpose**
+  - `ShadowPlane` describes the receiver plane for planar shadows.
+  - Used by `Renderer` and `ShadowRenderer` to determine where projected
+    footprints are placed in world space.
+
+- **ShadowPlane::normal, d**
+  - `normal`
+    - Plane normal in world space; normalized on construction.
+    - The engine typically uses `(0, 1, 0)` for a horizontal ground plane.
+  - `d`
+    - Plane offset in the standard plane equation
+      `normal.x * x + normal.y * y + normal.z * z + d = 0`.
+    - For a horizontal plane at world Y = `y0`, the engine uses
+      `normal = (0, 1, 0)` and `d = -y0`.
+
+- **ShadowPlane::fromPointAndNormal(point, normal)**
+  - Helper that constructs a normalized plane from any world‑space point lying
+    on the plane and an (optionally unnormalized) normal.
+  - Convenient for custom receivers such as platforms or tilted floors.
+
+### ShadowSettings
+
+- **Purpose**
+  - Runtime configuration block for the shadow system, owned by `Renderer`.
+  - Encapsulates enable flags, color/opacity and receiver plane in a single
+    struct that can be stored, tweaked and reused.
+
+- **Fields**
+  - `enabled`
+    - Master switch for rendering shadows. When `false`, shadow rendering code
+      early‑outs without doing any work.
+  - `shadowColor`
+    - Base RGB565 color of the shadow in world space.
+    - Typically a very dark blue‑gray (default: `Color::fromRGB888(20, 20, 30)`).
+  - `shadowOpacity`
+    - Opacity factor in `[0, 1]` used both for darkening `shadowColor` and for
+      the alpha value passed into `Rasterizer::fillShadowTriangle`.
+    - Values are clamped to `[0, 1]` internally by the shadow renderer.
+  - `shadowOffset`
+    - Small offset added along the plane normal (for the default horizontal
+      plane this is +Y) to lift the shadow slightly above the receiver.
+    - Prevents z‑fighting and ensures that the shadow remains visible even when
+      geometry lies exactly on the plane.
+  - `softEdges`
+    - Enables simple edge softening inside `Rasterizer::fillShadowTriangle`.
+    - When `true`, border pixels use a reduced alpha based on their distance to
+      the triangle hull, producing a subtle penumbra.
+  - `plane`
+    - Receiver plane described by `ShadowProjector::ShadowPlane`.
+    - By default set to a horizontal plane at `Y = 0`.
+
+- **Construction**
+  - `ShadowSettings()`
+    - Initializes sensible defaults for ground‑plane shadows:
+      - `enabled = true`
+      - `shadowColor = Color::fromRGB888(20, 20, 30)`
+      - `shadowOpacity = 0.7f`
+      - `shadowOffset = 0.01f`
+      - `softEdges = true`
+      - `plane = ShadowPlane(Vector3(0, 1, 0), 0)` (Y = 0 ground)
+
+In most applications you work with `ShadowSettings` indirectly via
+high‑level `Renderer` methods:
+
+- `setShadowsEnabled(bool enabled)`
+- `setShadowOpacity(float opacity)`
+- `setShadowColor(const Color& color)`
+- `setShadowPlane(const Vector3& normal, float distance)`
+- `setShadowPlaneY(float y)`
+- `ShadowSettings& getShadowSettings()` to tweak `shadowOffset` / `softEdges`
+  directly when needed.
+
+### ShadowRenderer
+
+- **Purpose**
+  - Implements the low‑level planar shadow pass for both raw meshes and
+    `MeshInstance`s.
+  - Consumes `ShadowSettings`, the main light, camera matrices, viewport,
+    framebuffer and z‑buffer to draw projected “blob” shadows.
+  - Designed specifically for ESP32‑S3 without PSRAM: no dynamic allocations in
+    the hot path, all work is done with stack locals and existing engine
+    buffers.
+
+- **Light handling**
+  - Only the first light in the renderer’s light array (`lights[0]`) is used
+    for shadows.
+  - Supported `LightType` values:
+    - `LIGHT_DIRECTIONAL` — casts parallel shadows using the light direction.
+    - `LIGHT_POINT` — projects geometry from the point light position onto the
+      receiver plane.
+  - If there are no active lights or the main light is of another type,
+    shadow rendering is skipped.
+
+- **Shadow projection model**
+  - For **directional lights**:
+    - Each triangle vertex is projected along the (normalized) light direction
+      onto the plane defined by `ShadowSettings::plane`.
+    - The implementation clamps extremely shallow light angles to avoid
+      numerical issues, preserving stable shadows even when the sun is near
+      the horizon.
+  - For **point lights**:
+    - Each vertex is projected along the ray from the light position to the
+      vertex.
+    - When the ray is nearly parallel to the plane normal (very small Y
+      component for the default plane), a safe fallback places the projected
+      point directly above/below the original vertex on the receiver plane.
+
+- **Color and opacity**
+  - Internally `ShadowRenderer` derives a darkened shadow color and an 8‑bit
+    alpha from `ShadowSettings::shadowColor` and `shadowOpacity`:
+    - The RGB565 channels are scaled by `shadowOpacity`.
+    - The same factor is converted to `[0, 255]` and passed as the base alpha
+      to `Rasterizer::fillShadowTriangle`.
+  - This computation is shared between mesh and instance paths for maximum
+    consistency and minimal overhead.
+
+- **Z‑buffer and overdraw avoidance**
+  - Uses `ZBuffer<320, 240>::hasGeometry(x, y)` to skip pixels that have no
+    rendered geometry yet.
+  - Uses `ZBuffer<320, 240>::hasShadow(x, y)` / `markShadow(x, y)` to ensure
+    that each pixel receives at most one shadow contribution per frame.
+  - This keeps the shadow pass cheap even for scenes with many overlapping
+    projected triangles.
+
+- **Integration with the renderer**
+  - You normally do not call `ShadowRenderer` directly. Instead use
+    high‑level helpers:
+    - `Renderer::setShadowsEnabled(bool)`
+    - `Renderer::setShadowPlaneY(float)` and related configuration
+    - `Renderer::drawMeshShadow(Mesh*)`
+    - `Renderer::drawMeshInstanceShadow(MeshInstance*)`
+  - Utility helpers such as `ObjectHelper::renderWithShadow` can draw both the
+    shadow and the lit mesh in one call.
+
+This planar shadow system is deliberately simple and deterministic, making it a
+good fit for real‑time 3D on microcontrollers while still following
+industry‑standard concepts familiar from larger engines like Unreal Engine.
