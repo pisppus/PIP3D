@@ -3686,6 +3686,7 @@ public:
     static Color  getLightColor(const std::vector<Light>& lights, int activeLightCount);
     static void   setLightType(std::vector<Light>& lights, int activeLightCount, LightType type);
 };
+```
 
 ### Overview
 
@@ -3898,6 +3899,7 @@ public:
                                        ZBuffer<320, 240>* zBuffer,
                                        bool& backfaceCullingEnabled);
 };
+```
 
 ### ShadowProjector and ShadowPlane
 
