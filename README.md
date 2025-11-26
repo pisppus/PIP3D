@@ -9,6 +9,125 @@ basic memory helpers and optional systems such as events, profiling and resource
 
 ---
 
+## MeshRenderer (World Mesh Rendering)
+
+```cpp
+class MeshRenderer
+{
+public:
+    static void drawTriangle3D(const Vector3& v0,
+                               const Vector3& v1,
+                               const Vector3& v2,
+                               uint16_t       color,
+                               const Camera&  camera,
+                               const Viewport& viewport,
+                               const Matrix4x4& viewProjMatrix,
+                               FrameBuffer&   framebuffer,
+                               ZBuffer<320,240>* zBuffer,
+                               const Light*   lights,
+                               int            activeLightCount,
+                               bool           backfaceCullingEnabled,
+                               uint32_t&      statsTrianglesTotal,
+                               uint32_t&      statsTrianglesBackfaceCulled);
+
+    static void drawTriangle3DSmooth(const Vector3& v0,
+                                     const Vector3& v1,
+                                     const Vector3& v2,
+                                     const Vector3& n0,
+                                     const Vector3& n1,
+                                     const Vector3& n2,
+                                     uint16_t       color,
+                                     const Camera&  camera,
+                                     const Viewport& viewport,
+                                     const Matrix4x4& viewProjMatrix,
+                                     FrameBuffer&   framebuffer,
+                                     ZBuffer<320,240>* zBuffer,
+                                     const Light*   lights,
+                                     int            activeLightCount,
+                                     bool           backfaceCullingEnabled,
+                                     uint32_t&      statsTrianglesTotal,
+                                     uint32_t&      statsTrianglesBackfaceCulled);
+
+    static void drawMesh(Mesh*           mesh,
+                         bool            useGouraud,
+                         const Camera&   camera,
+                         const Viewport& viewport,
+                         const Frustum&  frustum,
+                         const Matrix4x4& viewProjMatrix,
+                         FrameBuffer&    framebuffer,
+                         ZBuffer<320,240>* zBuffer,
+                         const Light*    lights,
+                         int             activeLightCount,
+                         bool            backfaceCullingEnabled,
+                         uint32_t&       statsTrianglesTotal,
+                         uint32_t&       statsTrianglesBackfaceCulled);
+};
+```
+
+### Overview
+
+- **Purpose**
+  - High-level world mesh renderer used by `Renderer`.
+  - Bridges scene-space geometry (`Mesh`, `Camera`, `Frustum`) with the low-level `Rasterizer` and `Shading`.
+  - Designed as a stateless utility: all state is passed in as parameters.
+
+- **Typical usage**
+  - User code normally calls `Renderer::drawMesh` / `Renderer::drawMeshInstance*`.
+  - The renderer forwards to `MeshRenderer::drawMesh` (for static meshes) or to `drawTriangle3D*` (for custom primitives).
+
+### drawTriangle3D
+
+- **Description**
+  - Renders a single triangle with **flat lighting** based on a world-space normal and a single base color.
+
+- **Steps**
+  - Increments `statsTrianglesTotal`.
+  - Computes face normal in world space: `normal = (v1 - v0) × (v2 - v0)`.
+  - Computes `viewDir = camera.position - v0`.
+  - If `backfaceCullingEnabled` and `dot(normal, viewDir) <= 0`, increments `statsTrianglesBackfaceCulled` and skips the triangle.
+  - Projects `v0..v2` into screen space via `CameraController::project(viewProjMatrix, viewport)`.
+  - For perspective cameras, discards triangles where all three vertices are behind the camera (`z <= 0`).
+  - Normalizes `normal` and `viewDir` and computes a single lighting sample at the triangle barycenter using `Shading::calculateLighting`.
+  - Converts the resulting RGB color to RGB565 using `Shading::applyDithering`, sampling the dither pattern at `p0.x, p0.y`.
+  - Calls `Rasterizer::fillTriangle` with the shaded color and projected vertices.
+
+- **When to use**
+  - For solid objects where per-vertex lighting is sufficient.
+  - For debug geometry and simple primitives.
+
+### drawTriangle3DSmooth
+
+- **Description**
+  - Renders a single triangle with **Gouraud shading**, using per-vertex normals.
+
+- **Steps**
+  - Similar backface culling and projection path as `drawTriangle3D`.
+  - For each vertex, evaluates lighting via `Shading::calculateLighting` using the shared view direction from the triangle center.
+  - Passes per-vertex colors to `Rasterizer::fillTriangleSmooth`, which interpolates RGB across the triangle in screen space.
+
+- **When to use**
+  - For higher-quality shading on smooth surfaces (spheres, characters, etc.).
+
+### drawMesh
+
+- **Description**
+  - Renders an entire `Mesh` in world space with optional Gouraud shading and frustum culling.
+
+- **Steps**
+  - Early-out if `mesh == nullptr` or `!mesh->isVisible()`.
+  - Ensures world transform is up to date via `mesh->updateTransform()`.
+  - For perspective cameras, performs sphere-frustum culling using `mesh->center()` and `mesh->radius()`.
+  - Extracts a shared base color `mesh->color().rgb565`.
+  - Iterates over all faces (`mesh->numFaces()`):
+    - Retrieves geometry via `mesh->face(i)` and `mesh->vertex(face.v*)`.
+    - For Gouraud shading, also fetches per-vertex normals via `mesh->normal(face.v*)`.
+    - Calls either `drawTriangle3DSmooth` or `drawTriangle3D` accordingly.
+
+- **Integration**
+  - `Renderer::drawMesh` is a thin wrapper over this function, wiring in current camera, viewport, frustum, framebuffer, z-buffer, lights and stats.
+
+---
+
 ## DisplayConfig
 
 ```cpp
@@ -27,7 +146,7 @@ struct Display
   - Used by the renderer and framebuffer to size internal buffers.
 
 - **cs, dc, rst, bl**
-  - SPI control pins for the ST7789 display.
+  - SPI control pins for the ST7789Driver display.
   - `bl` (backlight) may be `-1` when not used.
 
 - **spi_freq**
@@ -37,7 +156,7 @@ Typical usage is to construct a `DisplayConfig` in `setup()` and pass it to `Ren
 
 ---
 
-## LCD and ST7789Display (Low-Level Display Driver)
+## LCD and ST7789Driver (Low-Level Display Driver)
 
 ```cpp
 struct LCD
@@ -59,11 +178,11 @@ struct LCD
 LCD S3();
 LCD S3(int8_t cs, int8_t dc, int8_t rst = 8);
 
-class ST7789Display
+class ST7789Driver
 {
 public:
-    ST7789Display();
-    ~ST7789Display();
+    ST7789Driver();
+    ~ST7789Driver();
 
     bool init(const LCD& cfg = LCD());
 
@@ -86,13 +205,13 @@ public:
 ### LCD
 
 - **Purpose**
-  - Describes the physical ST7789 panel wiring and SPI frequency.
+  - Describes the physical ST7789Driver panel wiring and SPI frequency.
   - Used as a thin configuration layer between high-level `DisplayConfig` and the hardware driver.
 
 - **Fields**
   - `w, h`
     - Native panel resolution in pixels.
-    - Defaults to `320 x 240` which matches the typical ESP32-S3 ST7789 modules.
+    - Defaults to `320 x 240` which matches the typical ESP32-S3 ST7789Driver modules.
   - `cs, dc, rst, bl`
     - Chip-select, data/command, reset and backlight pins.
     - `bl` can be `-1` when backlight is hard-wired.
@@ -111,27 +230,27 @@ public:
 
 - **Presets for ESP32-S3**
   - `S3()`
-    - Returns default LCD config for a typical 320x240 ST7789 on ESP32-S3 with default pins and 80 MHz SPI.
+    - Returns default LCD config for a typical 320x240 ST7789Driver on ESP32-S3 with default pins and 80 MHz SPI.
   - `S3(cs, dc, rst)`
     - Same as `S3()`, but overrides control pins.
 
 Use `LCD` when directly constructing a low-level display driver or when using the `Screen` helper (see `graphics/pip3D_screen.h`). High-level engine code usually works with `DisplayConfig` instead.
 
-### ST7789Display
+### ST7789Driver
 
 - **Purpose**
-  - Low-level, high-performance SPI driver for ST7789 TFT panels.
+  - Low-level, high-performance SPI driver for ST7789Driver TFT panels.
   - Owns the SPI device handle, configures the bus, manages DMA-capable buffers and performs endian conversion.
   - Used internally by `FrameBuffer` via `Renderer`, but can also be driven directly for custom UIs.
 
 - **Lifetime and initialization**
   - `bool init(const LCD& cfg = LCD())`
     - Configures GPIO directions for `cs`, `dc`, `rst`, `bl`.
-    - Initializes SPI bus on `SPI2_HOST` with DMA, attaches an ST7789 device and sends the recommended power-on sequence:
+    - Initializes SPI bus on `SPI2_HOST` with DMA, attaches an ST7789Driver device and sends the recommended power-on sequence:
       - `SWRESET`, `SLPOUT`, `MADCTL`, `COLMOD`, `INVON`, `NORON`, `DISPON`.
     - Allocates an internal DMA-friendly line buffer (`dmaBuffer`) for rectangle fills.
     - Can be called multiple times; previous DMA buffers and SPI device are safely released before reinitialization.
-  - `~ST7789Display()`
+  - `~ST7789Driver()`
     - Frees DMA/aligned buffers and detaches the SPI device, releasing the bus.
 
 - **Basic drawing**
@@ -155,7 +274,7 @@ Use `LCD` when directly constructing a low-level display driver or when using th
 
 - **Rotation and geometry**
   - `setRotation(r)`
-    - `r` in `[0, 3]` selects one of four standard ST7789 orientations.
+    - `r` in `[0, 3]` selects one of four standard ST7789Driver orientations.
     - Updates internal `width`/`height` and writes `MADCTL` accordingly.
   - `getWidth()`, `getHeight()`
     - Return the current logical resolution after rotation.
@@ -164,14 +283,14 @@ Use `LCD` when directly constructing a low-level display driver or when using th
 
 - **Engine-integrated path (recommended)**
   - Application code builds a `DisplayConfig` and passes it to `Renderer::init`.
-  - The renderer internally translates it to `LCD` and owns a single `ST7789Display` instance used by the main `FrameBuffer`.
+  - The renderer internally translates it to `LCD` and owns a single `ST7789Driver` instance used by the main `FrameBuffer`.
 
 - **Direct low-level control**
   - For lightweight demos or debugging overlays without the full 3D stack you can create and use the driver directly:
     - Construct `LCD` (or use `S3()` helper).
     - Call `init(cfg)` once.
     - Use `fillRect`, `fillScreen` or `pushImage` to draw.
-  - For convenience you can also use the `Screen` wrapper (`graphics/pip3D_screen.h`), which embeds `ST7789Display` and exposes a simpler 2D API.
+  - For convenience you can also use the `Screen` wrapper (`graphics/pip3D_screen.h`), which embeds `ST7789Driver` and exposes a simpler 2D API.
 
 This driver is tuned for ESP32-S3 running without PSRAM: all critical paths use DMA-capable internal memory, avoid unnecessary reallocations and are safe for long-running real-time rendering.
 
@@ -202,7 +321,7 @@ struct Color
 
 - **Storage format**
   - `rgb565` packed 16-bit color: R5 G6 B5.
-  - Optimized for ST7789 and the internal framebuffer.
+  - Optimized for ST7789Driver and the internal framebuffer.
 
 - **Construction helpers**
   - `Color(uint8_t r, uint8_t g, uint8_t b)` / `Color::rgb(r, g, b)`
@@ -314,7 +433,7 @@ class FrameBuffer
 public:
     FrameBuffer();
 
-    bool init(const DisplayConfig& cfg, ST7789Display* display);
+    bool init(const DisplayConfig& cfg, ST7789Driver* display);
 
     void beginFrame();
     void endFrame();
@@ -338,17 +457,17 @@ public:
 
 - **Purpose**
   - Owns the main RGB565 back buffer for the 3D renderer.
-  - Bridges high-level rendering code and the low-level `ST7789Display::pushImage`.
+  - Bridges high-level rendering code and the low-level `ST7789Driver::pushImage`.
   - Implements skybox/clear logic and provides a raw pointer for rasterizers and HUD.
 
 - **Lifetime**
   - Typically embedded as a member of `Renderer`.
-  - `Renderer::init` creates a single `ST7789Display` and passes it to `FrameBuffer::init`.
+  - `Renderer::init` creates a single `ST7789Driver` and passes it to `FrameBuffer::init`.
   - The framebuffer allocates a single DMA-capable `width * height` buffer and frees it in its destructor.
 
 ### Initialization and configuration
 
-- `bool init(const DisplayConfig& cfg, ST7789Display* display)`
+- `bool init(const DisplayConfig& cfg, ST7789Driver* display)`
   - Allocates an aligned RGB565 buffer of size `cfg.width * cfg.height`.
   - Uses PSRAM (`MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA`) when available, otherwise internal DMA-capable RAM.
   - Returns `false` if called more than once on the same instance or when allocation fails.
@@ -374,13 +493,13 @@ public:
 
 - `void endFrame()`
   - If the buffer or display pointer is null, does nothing.
-  - Uploads the entire framebuffer to the display via `ST7789Display::pushImage(0, 0, width, height, buffer)`.
+  - Uploads the entire framebuffer to the display via `ST7789Driver::pushImage(0, 0, width, height, buffer)`.
   - Used by `DirtyRegionHelper` when a full-screen refresh is more efficient than partial updates.
 
 - `void endFrameRegion(int16_t x, int16_t y, int16_t w, int16_t h)`
   - If the buffer or display pointer is null, does nothing.
   - Requests a partial upload of the rectangle `(x, y, w, h)` from the main buffer.
-  - Coordinates are in framebuffer space; clipping and bounds checks are handled by `ST7789Display::pushImage`.
+  - Coordinates are in framebuffer space; clipping and bounds checks are handled by `ST7789Driver::pushImage`.
   - Called by `DirtyRegionHelper::finalizeFrame` for dirty rectangles and HUD regions.
 
 ### Skybox and clear color control
@@ -792,12 +911,281 @@ complementing higher-level tools.
 
 ---
 
+## Logging (Debug::Logger and LOG macros)
+
+```cpp
+namespace pip3D
+{
+    namespace Debug
+    {
+        enum LogLevel : uint8_t
+        {
+            LOG_LEVEL_OFF    = 0,
+            LOG_LEVEL_ERROR  = 1,
+            LOG_LEVEL_WARNING= 2,
+            LOG_LEVEL_INFO   = 3,
+            LOG_LEVEL_DEBUG  = 4,
+            LOG_LEVEL_TRACE  = 5
+        };
+
+        enum LogModule : uint16_t
+        {
+            LOG_MODULE_CORE         = 1u << 0,
+            LOG_MODULE_RENDER       = 1u << 1,
+            LOG_MODULE_PHYSICS      = 1u << 2,
+            LOG_MODULE_CAMERA       = 1u << 3,
+            LOG_MODULE_SCENE        = 1u << 4,
+            LOG_MODULE_RESOURCES    = 1u << 5,
+            LOG_MODULE_PERFORMANCE  = 1u << 6,
+            LOG_MODULE_USER         = 1u << 7,
+            LOG_MODULE_ALL          = 0xFFFFu
+        };
+
+        class Logger
+        {
+        public:
+            static void     init(LogLevel level = LOG_LEVEL_INFO,
+                                 uint16_t modulesMask = LOG_MODULE_ALL,
+                                 bool      timestamps = true);
+            static void     setLevel(LogLevel level);
+            static LogLevel getLevel();
+
+            static void     setModules(uint16_t mask);
+            static void     enableModule(uint16_t module);
+            static void     disableModule(uint16_t module);
+            static uint16_t getModules();
+
+            static void     setModuleLevel(uint16_t module, LogLevel level);
+            static LogLevel getModuleLevel(uint16_t module);
+            static void     clearModuleLevels();
+
+            static void     setProfileSilent();
+            static void     setProfilePerformance();
+            static void     setProfileVerboseAll();
+
+            static void     setTimestampsEnabled(bool enabled);
+            static bool     getTimestampsEnabled();
+            static bool     isEnabled(uint16_t module, LogLevel level);
+            static void     log(uint16_t module, LogLevel level, const char* fmt, ...);
+        };
+    }
+}
+
+#define LOG(module, level, fmt, ...) \
+    ::pip3D::Debug::Logger::log(module, level, fmt, ##__VA_ARGS__)
+
+#define LOGE(module, fmt, ...) LOG(module, ::pip3D::Debug::LOG_LEVEL_ERROR,   fmt, ##__VA_ARGS__)
+#define LOGW(module, fmt, ...) LOG(module, ::pip3D::Debug::LOG_LEVEL_WARNING, fmt, ##__VA_ARGS__)
+#define LOGI(module, fmt, ...) LOG(module, ::pip3D::Debug::LOG_LEVEL_INFO,    fmt, ##__VA_ARGS__)
+#define LOGD(module, fmt, ...) LOG(module, ::pip3D::Debug::LOG_LEVEL_DEBUG,   fmt, ##__VA_ARGS__)
+#define LOGT(module, fmt, ...) LOG(module, ::pip3D::Debug::LOG_LEVEL_TRACE,   fmt, ##__VA_ARGS__)
+```
+
+- **Overview**
+  - Lightweight, compile-time configurable logging system for ESP32-S3.
+  - Uses `LogLevel` and `LogModule` similar to category/verbosity pairs in big engines.
+  - Output goes to the Arduino `Serial` port; there are no dynamic allocations.
+
+- **Compile-time configuration (`DebugConfig.h`)**
+
+- **Log levels**
+  - `LOG_LEVEL_ERROR`   – critical failures.
+  - `LOG_LEVEL_WARNING` – recoverable problems or suspicious states.
+  - `LOG_LEVEL_INFO`    – lifecycle and high-level state changes.
+  - `LOG_LEVEL_DEBUG`   – detailed debug output.
+  - `LOG_LEVEL_TRACE`   – very verbose tracing, usually disabled on devices.
+
+- **Log modules**
+  - Bitmask identifying subsystem:
+    - `LOG_MODULE_CORE`, `LOG_MODULE_RENDER`, `LOG_MODULE_PHYSICS`,
+      `LOG_MODULE_CAMERA`, `LOG_MODULE_SCENE`, `LOG_MODULE_RESOURCES`,
+      `LOG_MODULE_PERFORMANCE`, `LOG_MODULE_USER`.
+  - `LOG_MODULE_ALL` enables all modules.
+
+- **Runtime configuration**
+  - `Logger::init(level, modulesMask, timestamps)`
+    - Optional explicit initialization; otherwise the logger initializes lazily
+      on the first `LOG*` call using compile-time defaults.
+  - `Logger::setLevel(level)` / `Logger::getLevel()`
+    - Global verbosity threshold.
+  - `Logger::setModules(mask)` / `enableModule(module)` / `disableModule(module)`
+    - Control which subsystems emit logs.
+  - `Logger::setModuleLevel(module, level)`
+    - Override global level for a specific module, similar to Unreal's per-category verbosity.
+  - `Logger::clearModuleLevels()`
+    - Clears all per-module overrides.
+  - `Logger::setTimestampsEnabled(enabled)`
+    - Toggles `[seconds.milliseconds]` prefix computed from `micros()`.
+
+- **Profiles**
+  - `Logger::setProfileSilent()` / `LOG_PROFILE_SILENT()`
+    - Focus on warnings and errors only.
+  - `Logger::setProfilePerformance()` / `LOG_PROFILE_PERF()`
+    - Emphasizes performance and core logs, suitable for frame-time tuning.
+  - `Logger::setProfileVerboseAll()` / `LOG_PROFILE_VERBOSE()`
+    - Enables maximum verbosity for all modules.
+
+- **Macros for user code**
+  - Use `LOGE/LOGW/LOGI/LOGD/LOGT` with a `LogModule` and `printf`-style format:
+    - `LOGI(LOG_MODULE_RENDER, "Renderer::init OK: %dx%d", width, height);`
+  - When `ENABLE_LOGGING == 0`, all these macros collapse to no-ops.
+
+---
+
+## Debug Drawing (Debug::DebugDraw and DBG_* macros)
+
+```cpp
+namespace pip3D
+{
+    class Renderer;
+
+    namespace Debug
+    {
+        enum DebugCategory : uint16_t
+        {
+            DEBUG_CATEGORY_NONE        = 0,
+            DEBUG_CATEGORY_PHYSICS     = 1u << 0,
+            DEBUG_CATEGORY_CAMERA      = 1u << 1,
+            DEBUG_CATEGORY_MESHES      = 1u << 2,
+            DEBUG_CATEGORY_LIGHTING    = 1u << 3,
+            DEBUG_CATEGORY_PERFORMANCE = 1u << 4,
+            DEBUG_CATEGORY_USER        = 1u << 5,
+            DEBUG_CATEGORY_ALL         = 0xFFFFu
+        };
+
+        class DebugDraw
+        {
+        public:
+            static void     setCategories(uint16_t mask);
+            static void     enableCategories(uint16_t mask);
+            static void     disableCategories(uint16_t mask);
+            static uint16_t getCategories();
+
+            static void     beginFrame();
+            static bool     hasPrimitives();
+
+            static void     addLine(const Vector3& a, const Vector3& b,
+                                    uint16_t color,
+                                    uint16_t categories = DEBUG_CATEGORY_USER,
+                                    uint16_t lifetimeFrames = 1,
+                                    uint8_t  thickness = 1);
+
+            static void     addRay(const Vector3& origin, const Vector3& dir,
+                                   float length,
+                                   uint16_t color,
+                                   uint16_t categories = DEBUG_CATEGORY_USER,
+                                   uint16_t lifetimeFrames = 1,
+                                   uint8_t  thickness = 1);
+
+            static void     addAABB(const AABB& box,
+                                    uint16_t color,
+                                    uint16_t categories = DEBUG_CATEGORY_PHYSICS,
+                                    uint16_t lifetimeFrames = 1,
+                                    uint8_t  thickness = 1);
+
+            static void     addSphere(const Vector3& center, float radius,
+                                      uint16_t color,
+                                      uint16_t categories = DEBUG_CATEGORY_PHYSICS,
+                                      uint16_t lifetimeFrames = 1,
+                                      uint8_t  thickness = 1);
+
+            static void     addAxes(const Vector3& origin, float size,
+                                    uint16_t categories = DEBUG_CATEGORY_CAMERA,
+                                    uint16_t lifetimeFrames = 1,
+                                    uint8_t  thickness = 1);
+
+            static void     render(Renderer& renderer);
+        };
+    }
+}
+
+#if ENABLE_DEBUG_DRAW
+
+#define DBG_LINE(renderer, a, b, color, categories) \
+    ::pip3D::Debug::DebugDraw::addLine(a, b, color, categories)
+
+#define DBG_RAY(renderer, origin, dir, length, color, categories) \
+    ::pip3D::Debug::DebugDraw::addRay(origin, dir, length, color, categories)
+
+#define DBG_AABB(renderer, box, color, categories) \
+    ::pip3D::Debug::DebugDraw::addAABB(box, color, categories)
+
+#define DBG_SPHERE(renderer, center, radius, color, categories) \
+    ::pip3D::Debug::DebugDraw::addSphere(center, radius, color, categories)
+
+#define DBG_AXES(renderer, origin, size, categories) \
+    ::pip3D::Debug::DebugDraw::addAxes(origin, size, categories)
+
+#else
+
+#define DBG_LINE(renderer, a, b, color, categories) \
+    do { (void)(renderer); } while (0)
+
+#define DBG_RAY(renderer, origin, dir, length, color, categories) \
+    do { (void)(renderer); } while (0)
+
+#define DBG_AABB(renderer, box, color, categories) \
+    do { (void)(renderer); } while (0)
+
+#define DBG_SPHERE(renderer, center, radius, color, categories) \
+    do { (void)(renderer); } while (0)
+
+#define DBG_AXES(renderer, origin, size, categories) \
+    do { (void)(renderer); } while (0)
+
+#endif
+```
+
+- **Overview**
+  - Immediate-mode world-space debug drawing for lines, rays, bounding boxes, spheres and axes.
+  - Uses the main `Renderer` to project 3D points and draw into the framebuffer.
+  - Fully disabled at compile time when `ENABLE_DEBUG_DRAW == 0` (macros become no-ops).
+
+- **Categories mask**
+  - `setCategories(mask)` / `enableCategories(mask)` / `disableCategories(mask)` / `getCategories()`
+    - Control which `DebugCategory` bits are currently visible.
+    - Examples:
+      - `DEBUG_CATEGORY_PHYSICS` for collision volumes, `DEBUG_CATEGORY_CAMERA` for camera helpers,
+        `DEBUG_CATEGORY_PERFORMANCE` for perf overlays, `DEBUG_CATEGORY_USER` for your own markers.
+
+- **Frame lifecycle**
+  - `beginFrame()`
+    - Called once per frame from `Renderer::beginFrame()`.
+    - Decrements lifetimes of all stored lines and compacts the internal buffer.
+  - `render(Renderer& renderer)`
+    - Called from `Renderer::endFrame()` before dirty-region finalization.
+    - Projects 3D endpoints to screen space and rasterizes 2D lines into the framebuffer.
+
+- **Primitive helpers**
+  - `addLine(a, b, color, categories, lifetimeFrames, thickness)`
+    - Adds a single 3D line segment.
+  - `addRay(origin, dir, length, color, categories, lifetimeFrames, thickness)`
+    - Normalizes `dir`, scales it by `length` and internally calls `addLine`.
+  - `addAABB(box, color, categories, lifetimeFrames, thickness)`
+    - Enqueues all 12 edges of an axis-aligned bounding box.
+  - `addSphere(center, radius, color, categories, lifetimeFrames, thickness)`
+    - Approximates a sphere with three great-circle loops (XY/XZ/YZ planes).
+  - `addAxes(origin, size, categories, lifetimeFrames, thickness)`
+    - Adds three color-coded axes: +X (red), +Y (green), +Z (blue).
+
+- **Macros for user code**
+  - Preferred public entry points are the `DBG_*` macros:
+    - `DBG_LINE(renderer, a, b, color, categories)`
+    - `DBG_RAY(renderer, origin, dir, length, color, categories)`
+    - `DBG_AABB(renderer, box, color, categories)`
+    - `DBG_SPHERE(renderer, center, radius, color, categories)`
+    - `DBG_AXES(renderer, origin, size, categories)`
+  - In non-debug builds, these macros compile to no-ops while keeping the call sites valid.
+
+---
+
 ## ResourceManager
 
 ```cpp
 enum ResourceType
 {
     RES_TEXTURE = 0,
+{{ ... }
     RES_MESH    = 1,
     RES_SOUND   = 2,
     RES_DATA    = 3
@@ -862,6 +1250,83 @@ The camera is designed for real‑time 3D rendering on ESP32‑S3 without PSRAM 
 - **Built‑in helpers**: animation support, free‑fly camera, orbit camera and builder pattern for convenient setup.
 
 Use this document as a reference when configuring or controlling cameras from your application code.
+
+---
+
+## CameraController (View/Projection Management)
+
+```cpp
+class CameraController
+{
+public:
+    static void updateViewProjectionIfNeeded(Camera&    camera,
+                                             const Viewport& viewport,
+                                             Matrix4x4& viewMatrix,
+                                             Matrix4x4& projMatrix,
+                                             Matrix4x4& viewProjMatrix,
+                                             Frustum&  frustum,
+                                             bool&     viewProjMatrixDirty,
+                                             bool&     cameraChangedThisFrame);
+
+    static Vector3 project(const Vector3&   v,
+                           const Matrix4x4& viewProjMatrix,
+                           const Viewport&  viewport);
+};
+```
+
+### Overview
+
+- **Purpose**
+  - Centralizes camera-dependent matrix updates for the renderer.
+  - Provides a single, consistent projection function from world space to screen space.
+  - Keeps the `Renderer` class lean by moving camera math to a dedicated helper.
+
+### updateViewProjectionIfNeeded
+
+- **Signature**
+  - `static void updateViewProjectionIfNeeded(Camera& camera, const Viewport& viewport, Matrix4x4& viewMatrix, Matrix4x4& projMatrix, Matrix4x4& viewProjMatrix, Frustum& frustum, bool& viewProjMatrixDirty, bool& cameraChangedThisFrame)`
+
+- **Behavior**
+  - Checks whether any of the following are true:
+    - `viewProjMatrixDirty == true` (explicit invalidation by the renderer).
+    - `camera.cache.flags.viewDirty == true` (camera's view changed).
+    - `camera.cache.flags.projDirty == true` (camera's projection changed or aspect changed).
+  - When an update is required:
+    - Computes `aspect = viewport.width / viewport.height`.
+    - Fetches `viewMatrix = camera.getViewMatrix()`.
+    - Fetches `projMatrix = camera.getProjectionMatrix(aspect)`.
+    - Computes the combined matrix `viewProjMatrix = projMatrix * viewMatrix`.
+    - Clears `viewProjMatrixDirty`.
+    - Extracts frustum planes via `frustum.extractFromViewProjection(viewProjMatrix)`.
+    - Sets `cameraChangedThisFrame = true` so the dirty-region system can react.
+
+- **Usage**
+  - Called from `Renderer::beginFrame()` once per frame:
+    - Ensures that all subsequent culling and projection operations use up-to-date matrices.
+  - User code normally does not call this directly; instead, you:
+    - Modify `Camera` via its high-level API (`move`, `rotate`, `setPerspective`, etc.).
+    - Call `Renderer::beginFrame()`, which will trigger a lazy update when needed.
+
+### project
+
+- **Signature**
+  - `static Vector3 project(const Vector3& v, const Matrix4x4& viewProjMatrix, const Viewport& viewport)`
+
+- **Behavior**
+  - Transforms a world-space position `v` by `viewProjMatrix` using `Matrix4x4::transform`.
+  - Performs the standard homogeneous divide inside `transform`.
+  - Converts normalized device coordinates (NDC) into framebuffer pixel coordinates:
+    - `x_screen = (ndc.x + 1) * viewport.width * 0.5f + viewport.x`.
+    - `y_screen = (1 - ndc.y) * viewport.height * 0.5f + viewport.y`.
+    - `z` is preserved as the post-projection depth value for visibility tests.
+
+- **Usage**
+  - Used by:
+    - `Renderer::project` as a public projection helper.
+    - `MeshRenderer` to convert world-space vertices of triangles into screen space.
+    - `ShadowRenderer` to project shadow hull vertices.
+    - `Culling::isInstanceOccluded` and `Renderer::addDirtyFromSphere` to compute screen-space bounds of bounding spheres.
+  - Typical user-level access is via `Renderer::project`, which internally calls this helper.
 
 ---
 
@@ -1253,6 +1718,82 @@ When writing your own systems, prefer using the public `Camera` methods (`setPer
 
 ---
 
+## Scene Graph
+
+The scene graph module lives in `lib/Pip3D/scene/pip3D_node.h` and
+`lib/Pip3D/scene/pip3D_scenegraph.h`. It provides a lightweight hierarchy of
+nodes similar in spirit to `AActor` / `USceneComponent` in Unreal Engine.
+
+- **Node**
+  - Base class with local transform (`position`, `rotation`, `scale`), parent
+    pointer and array of children.
+  - Owns its children and deletes them in the destructor.
+  - `setPosition`, `setRotation`, `setScale`, `translate`, `rotate` mark the
+    node and all descendants as transform‑dirty.
+  - `getWorldTransform()` lazily recomputes the world matrix from the parent
+    chain; `getWorldPosition()` extracts its translation.
+  - `update(dt)` and `render(renderer)` recurse into children when the node is
+    enabled / visible.
+
+- **MeshNode**
+  - Derives from `Node` and attaches a `Mesh*` plus a `castShadows` flag.
+  - Optionally owns the mesh (controlled by the `ownsMesh` parameter in
+    constructors and `setMesh`).
+  - In `render(renderer)` copies the node transform into the mesh and calls
+    either `ObjectHelper::renderWithShadow(renderer, mesh)` or
+    `Renderer::drawMesh(mesh)`, then traverses children.
+
+- **CameraNode**
+  - Derives from `Node` and stores `fov`, `nearPlane`, `farPlane` and
+    `projectionType`.
+  - `applyToCamera(Camera&)` copies these parameters plus the node world
+    position into a target `Camera` and calls `Camera::markDirty()`.
+  - Typical usage: create one `CameraNode`, move it like any other node, and
+    set it as the active camera in `SceneGraph`.
+
+- **LightNode**
+  - Derives from `Node` and stores `LightType`, `Color`, `intensity`,
+    `direction` and `range`.
+  - `applyToLight(Light&)` fills a `Light` struct:
+    - for `LIGHT_DIRECTIONAL` copies and normalizes `direction`;
+    - for `LIGHT_POINT` uses the node world position as `light.position` and
+      passes through `range` for distance attenuation.
+
+- **SceneGraph**
+  - Owns a single root `Node` and a pointer to a `Renderer`.
+  - Manages:
+    - creation of `MeshNode`, `CameraNode`, `LightNode` attached to the root;
+    - active camera (`setActiveCamera`, `getActiveCamera`);
+    - a small list of `LightNode*` used for shading.
+  - `update(dt)` calls `root->update(dt)`.
+  - `render()`:
+    - applies the active `CameraNode` to `renderer.getCamera()` if present;
+    - calls `renderer.clearLights()` and submits up to four enabled & visible
+      `LightNode` instances via `renderer.setLight(index, light)`;
+    - calls `renderer.beginFrame()`, `root->render(renderer)` and
+      `renderer.endFrame()`.
+
+- **SceneBuilder**
+  - Small fluent helper around `SceneGraph`.
+  - Typical usage:
+
+    ```cpp
+    SceneBuilder builder(&renderer);
+    SceneGraph* scene = builder
+        .withCamera(0.0f, 2.5f, 6.0f, 60.0f)
+        .withSun(-0.3f, -1.0f, -0.2f)
+        .addMesh(&someMesh, "Object")
+        .build();
+    ```
+
+  - `withCamera` creates a `CameraNode`, positions it, sets FOV and assigns it
+    as the active camera.
+  - `withSun` / `withPointLight` create directional or point lights with
+    sensible defaults for color and intensity.
+  - `addMesh` wraps `SceneGraph::createMeshNode` for quick object placement.
+
+---
+
 ## Frustum and Culling
 
 This section describes the view frustum utilities defined in `lib/Pip3D/core/pip3D_frustum.h`.
@@ -1478,7 +2019,7 @@ public:
 - **Purpose**
   - Tracks screen‑space regions that changed this frame and performs partial buffer
     uploads instead of full‑screen refreshes.
-  - Designed for ESP32‑S3 + ST7789 where SPI bandwidth is the main bottleneck.
+  - Designed for ESP32‑S3 + ST7789Driver where SPI bandwidth is the main bottleneck.
   - Used internally by `Renderer` together with `FrameBuffer` and `Viewport`.
 
 - **High‑level behavior**
@@ -2079,6 +2620,71 @@ public:
   - Packs the result into a single `uint16_t` in RGB565 format.
   - Used by `Rasterizer::fillTriangleSmooth` and by flat-shaded paths
     when they already have linear RGB values.
+
+---
+
+## Culling (Occlusion Culling Helper)
+
+```cpp
+class Culling
+{
+public:
+    static bool isInstanceOccluded(const Vector3&    center,
+                                   float             radius,
+                                   const Camera&     camera,
+                                   const Viewport&   viewport,
+                                   const Matrix4x4&  viewProjMatrix,
+                                   ZBuffer<320,240>* zBuffer,
+                                   const DisplayConfig& cfg);
+};
+```
+
+### Overview
+
+- **Purpose**
+  - Performs a conservative screen-space occlusion test for mesh instances.
+  - Uses the engine-wide `ZBuffer<320, 240>` populated by previous draw calls.
+  - Intended to be called from `Renderer` before issuing instance draw calls.
+
+### isInstanceOccluded
+
+- **Inputs**
+  - `center`, `radius`
+    - World-space center and bounding-sphere radius of the instance.
+  - `camera`
+    - Active camera; only `projectionType` and its view/projection are relevant.
+  - `viewport`
+    - Current viewport; defines the mapping from NDC to framebuffer pixels.
+  - `viewProjMatrix`
+    - Combined matrix used both for projection and for frustum extraction.
+  - `zBuffer`
+    - Pointer to the `ZBuffer<320, 240>`; may be `nullptr` when occlusion culling is disabled.
+  - `cfg`
+    - `DisplayConfig` providing framebuffer dimensions (`width`, `height`).
+
+- **Algorithm (simplified)**
+  - Early-out:
+    - Returns `false` (not occluded) if `zBuffer == nullptr` or `radius <= 0`.
+  - Projects the sphere center via `CameraController::project` and, for perspective cameras,
+    skips spheres entirely behind the camera (`pc.z <= 0`).
+  - Projects three offset points along world-space axes to estimate a conservative
+    screen-space radius `rScr` around the center.
+  - Builds a square test region `[sx0, sx1] × [sy0, sy1]` around the center in pixel space,
+    clipped to `[0, cfg.width)` × `[0, cfg.height)`.
+  - If the region is fully off-screen or degenerates to zero area, returns `false`.
+  - Computes sampling steps `stepX`, `stepY` as half of the region size (minimum 1 pixel).
+  - Iterates over this coarse grid and checks `zBuffer->hasGeometry(x, y)`:
+    - If any sample reports **no geometry**, returns `false` (instance is considered visible).
+  - If all samples report geometry, returns `true` — the instance is assumed to be
+    fully occluded by previously drawn content.
+
+- **Usage notes**
+  - Designed for use after primary opaque geometry has been rendered into the z-buffer.
+  - Provides a cheap secondary visibility test in addition to frustum culling.
+  - The coarse sampling pattern trades a tiny risk of false positives for performance,
+    which is acceptable on ESP32-S3 in typical scenes.
+
+---
 
 ## Math Utilities (FastMath, Vector3, Matrix4x4, Quaternion)
 
@@ -4040,3 +4646,336 @@ high‑level `Renderer` methods:
 This planar shadow system is deliberately simple and deterministic, making it a
 good fit for real‑time 3D on microcontrollers while still following
 industry‑standard concepts familiar from larger engines like Unreal Engine.
+
+## Renderer
+
+The `Renderer` is the high‑level entry point for the 3D pipeline. It owns the
+framebuffer, z‑buffer, cameras, light list and shadow settings, and exposes a
+compact API for:
+
+- setting up the display and internal buffers;
+- controlling the active camera and viewport;
+- configuring lighting and skybox;
+- drawing meshes and instances (including planar shadows);
+- rendering HUD text and screen‑space FX;
+- querying basic performance and visibility statistics.
+
+```cpp
+class Renderer
+{
+public:
+    enum ShadingMode
+    {
+        SHADING_FLAT   = 0,
+        SHADING_GOURAUD = 1
+    };
+
+    Renderer();
+
+    bool      init(const DisplayConfig& cfg);
+
+    void      beginFrame();
+    void      endFrame();
+    void      endFrameRegion(int16_t x, int16_t y, int16_t w, int16_t h);
+
+    Vector3   project(const Vector3& v);
+
+    Camera&   getCamera();
+    Camera&   getCamera(int index);
+    int       createCamera();
+    void      setActiveCamera(int index);
+    int       getActiveCameraIndex() const;
+    int       getCameraCount() const;
+    const Frustum&  getFrustum() const;
+    const Viewport& getViewport() const;
+
+    uint16_t* getFrameBuffer() const;
+
+    float     getFPS() const;
+    float     getAverageFPS() const;
+    uint32_t  getFrameTime() const;
+
+    // Lighting API
+    void      setLight(int index, const Light& light);
+    int       addLight(const Light& light);
+    void      removeLight(int index);
+    Light*    getLight(int index);
+    void      clearLights();
+    int       getLightCount() const;
+
+    void      setMainDirectionalLight(const Vector3& direction,
+                                      const Color&  color,
+                                      float         intensity = 1.0f);
+    void      setMainPointLight(const Vector3& position,
+                                const Color&  color,
+                                float         intensity = 1.0f,
+                                float         range     = 10.0f);
+
+    void      setLightColor(const Color& color);
+    void      setLightPosition(const Vector3& pos);
+    void      setLightDirection(const Vector3& dir);
+    void      setLightTemperature(float kelvin);
+    Color     getLightColor() const;
+    void      setLightType(LightType type);
+
+    // Shadows
+    void      setShadowsEnabled(bool enabled);
+    bool      getShadowsEnabled() const;
+    void      setShadowOpacity(float opacity);
+    void      setShadowColor(const Color& color);
+    void      setShadowPlane(const Vector3& normal, float distance);
+    void      setShadowPlaneY(float y);
+    ShadowSettings& getShadowSettings();
+
+    // Skybox and clear color
+    void      setSkyboxEnabled(bool enabled);
+    void      setSkyboxType(SkyboxType type);
+    void      setSkyboxWithLighting(SkyboxType type);
+    void      setClearColor(Color color);
+    Skybox&   getSkybox();
+    bool      isSkyboxEnabled() const;
+
+    // Shading and culling
+    void      setShadingMode(ShadingMode mode);
+    ShadingMode getShadingMode() const;
+    void      setBackfaceCullingEnabled(bool enabled);
+    bool      getBackfaceCullingEnabled() const;
+
+    // Text and HUD
+    void      drawText(int16_t x, int16_t y,
+                       const char* text,
+                       uint16_t color = 0xFFFF);
+    void      drawText(int16_t x, int16_t y,
+                       const char* text,
+                       Color color);
+    void      drawTextAdaptive(int16_t x, int16_t y,
+                              const char* text);
+    uint16_t  getAdaptiveTextColor(int16_t x, int16_t y,
+                                   int16_t width  = 40,
+                                   int16_t height = 8);
+    int16_t   getTextWidth(const char* text);
+
+    // Mesh and instance rendering
+    void      drawMesh(Mesh* mesh);
+    void      drawMesh(Mesh* mesh, ShadingMode mode);
+
+    void      drawMeshInstance(MeshInstance* instance);
+    void      drawMeshInstance(MeshInstance* instance, ShadingMode mode);
+    void      drawMeshInstanceStatic(MeshInstance* instance);
+    void      drawInstances(InstanceManager& manager);
+
+    void      drawMeshShadow(Mesh* mesh);
+    void      drawMeshInstanceShadow(MeshInstance* instance);
+
+    // Utility
+    void      drawSunSprite(const Vector3& worldPos,
+                            const Color&  color,
+                            float         glow);
+
+    uint32_t  getStatsTrianglesTotal() const;
+    uint32_t  getStatsTrianglesBackfaceCulled() const;
+    uint32_t  getStatsInstancesTotal() const;
+    uint32_t  getStatsInstancesFrustumCulled() const;
+    uint32_t  getStatsInstancesOcclusionCulled() const;
+};
+```
+
+### Overview
+
+- **Purpose**
+  - Encapsulates the full real‑time 3D rendering pipeline for ESP32‑S3.
+  - Owns the display‑backed framebuffer, 16‑bit z‑buffer and per‑frame dirty
+    region tracking.
+  - Orchestrates mesh drawing, lighting, skybox, planar shadows and HUD.
+
+- **Design goals**
+  - Zero allocations per frame in the hot path.
+  - Compatible with boards **with and without PSRAM**.
+  - Compact, UE‑style high‑level API, while delegating heavy math to
+    specialized subsystems (`MeshRenderer`, `ShadowRenderer`, `HudRenderer`).
+
+Typical applications create a single `Renderer` instance during startup and use
+it as the central entry point for all rendering.
+
+### Initialization and lifetime
+
+- **Renderer()**
+  - Constructs an empty renderer with one default camera and one default
+    directional light.
+  - Does **not** allocate the framebuffer, z‑buffer or touch the display.
+
+- **bool init(const DisplayConfig& cfg)**
+  - Enables the dual‑core job system via `useDualCore(true)`.
+  - Lazily creates a single `ST7789Driver` instance (if not already present)
+    and initializes it with `cfg`.
+  - Initializes the main `FrameBuffer` and a `ZBuffer<320, 240>`; both are
+    reused across all frames.
+  - Returns `false` when display, framebuffer or z‑buffer initialization fails;
+    all partially created resources are cleaned up.
+
+The renderer is intended to be initialized **once** during setup; repeated
+calls to `init` are allowed but uncommon.
+
+### Frame lifecycle and dirty regions
+
+- **beginFrame()**
+  - Starts a new frame:
+    - calls `PerformanceCounter::begin()`;
+    - prepares the framebuffer (skybox or clear color);
+    - clears the z‑buffer;
+    - resets per‑instance dirty regions and frame statistics;
+    - lazily updates `viewMatrix`, `projMatrix`, `viewProjMatrix` and `Frustum`
+      for the active camera via `CameraController::updateViewProjectionIfNeeded`.
+
+- **endFrame()**
+  - Finalizes the frame using `DirtyRegionHelper::finalizeFrame`:
+    - decides between full‑screen flush and a set of merged dirty rectangles;
+    - uploads only the necessary regions via `FrameBuffer::endFrameRegion`;
+    - ends the performance counter frame and periodically prints stats.
+
+- **endFrameRegion(x, y, w, h)**
+  - Low‑level helper that directly uploads a rectangle from the framebuffer and
+    ends the perf frame.
+  - Typically you do **not** need to call this manually; prefer `endFrame()`
+    and let the dirty‑region system decide what to flush.
+
+### Cameras and projection
+
+- **getCamera() / getCamera(index)**
+  - Returns a reference to the active camera or a specific camera by index.
+  - If `index` is out of range, `getCamera(index)` falls back to the active
+    camera.
+
+- **createCamera()**
+  - Appends a new camera to the internal array and returns its index.
+
+- **setActiveCamera(index)**
+  - Selects which camera drives view/projection matrices and culling.
+  - Marks the combined matrix as dirty so that the next `beginFrame()`
+    recomputes `viewProjMatrix` and frustum.
+
+- **project(v)**
+  - Transforms a world‑space point into screen space using the current
+    `viewProjMatrix` and `Viewport`.
+  - Used internally for dirty‑region tracking (`addDirtyFromSphere`) and by
+    systems such as `FXSystem` and `SceneHelper::renderSun`.
+
+### Lighting and skybox
+
+- **Light array management**: `setLight`, `addLight`, `removeLight`,
+  `getLight`, `clearLights`, `getLightCount`
+  - Thin wrappers over `LightManager` operating on the renderer‑owned
+    `std::vector<Light>` and `activeLightCount`.
+
+- **Main light helpers**: `setMainDirectionalLight`, `setMainPointLight`,
+  `setLightColor`, `setLightPosition`, `setLightDirection`,
+  `setLightTemperature`, `setLightType`, `getLightColor`
+  - Configure and query the primary light (slot 0) used by shading and
+    shadow systems.
+  - `setLightTemperature` is commonly driven by the skybox via
+    `setSkyboxWithLighting`.
+
+- **Skybox and clear color**: `setSkyboxEnabled`, `setSkyboxType`,
+  `setSkyboxWithLighting`, `getSkybox`, `isSkyboxEnabled`, `setClearColor`
+  - Control the background rendering performed by `FrameBuffer::beginFrame()`.
+  - `setSkyboxWithLighting` applies a sky preset and automatically adjusts the
+    main light color temperature to match the sky.
+
+### Shading mode and backface culling
+
+- **setShadingMode(mode) / getShadingMode()**
+  - Switch between flat (`SHADING_FLAT`) and Gouraud (`SHADING_GOURAUD`)
+    shading for mesh and instance rendering.
+
+- **setBackfaceCullingEnabled(enabled) / getBackfaceCullingEnabled()**
+  - Toggles backface culling in all mesh and shadow draw paths.
+  - When enabled (default), triangles facing away from the camera are skipped,
+    reducing overdraw and speeding up rasterization.
+
+### Mesh, instances and shadows
+
+- **drawMesh(mesh)** / **drawMesh(mesh, mode)**
+  - Renders a single mesh in world space using the current camera, lights,
+    shading mode and culling settings.
+
+- **drawMeshInstance(instance)** / **drawMeshInstance(instance, mode)**
+  - Draws a `MeshInstance` with per‑instance transform and color.
+  - Performs frustum culling (sphere vs. current frustum) and optional
+    occlusion culling before rasterization.
+
+- **drawMeshInstanceStatic(instance)**
+  - Same as `drawMeshInstance`, but does **not** track per‑instance dirty
+    regions. Intended for static world geometry used as part of the base
+    background.
+
+- **drawInstances(manager)**
+  - High‑level batched drawing path:
+    - culls all instances in `manager` against the current frustum;
+    - sorts them by distance to the active camera;
+    - draws each visible instance without re‑doing the frustum test.
+  - Recommended when you manage many instances via `InstanceManager`.
+
+- **drawMeshShadow(mesh)** / **drawMeshInstanceShadow(instance)**
+  - Render planar shadows for meshes and instances using current
+    `ShadowSettings` and main light.
+
+### Text, HUD and screen‑space FX
+
+- **drawText / drawText(Color)**
+  - Render fixed‑color ASCII text into the framebuffer via `HudRenderer` and
+    mark the corresponding HUD dirty rectangle.
+
+- **drawTextAdaptive / getAdaptiveTextColor / getTextWidth**
+  - Helpers for drawing text with automatically chosen contrast color based on
+    the underlying framebuffer contents.
+  - Used by debug overlays such as the FPS HUD.
+
+These methods are safe to call each frame and are cheap enough for simple
+debug text even on ESP32‑S3 without PSRAM.
+
+### Statistics and performance
+
+- **Frame‑time metrics**: `getFPS`, `getAverageFPS`, `getFrameTime`
+  - Thin wrappers over `PerformanceCounter` used for HUD and diagnostics.
+
+- **Visibility statistics**: `getStatsTrianglesTotal`,
+  `getStatsTrianglesBackfaceCulled`, `getStatsInstancesTotal`,
+  `getStatsInstancesFrustumCulled`, `getStatsInstancesOcclusionCulled`
+  - Accumulated per frame during mesh and instance rendering.
+  - Useful for understanding where time is spent (overdraw vs. culling).
+
+### Typical usage
+
+```cpp
+Renderer renderer;
+
+DisplayConfig cfg(320, 240, csPin, dcPin, rstPin);
+cfg.spi_freq = 100000000; // 100 MHz SPI for ST7789Driver
+
+if (!renderer.init(cfg))
+{
+    // handle error
+}
+
+Camera& cam = renderer.getCamera();
+cam.position = Vector3(0.0f, 2.5f, 6.0f);
+cam.target   = Vector3(0.0f, 1.0f, 0.0f);
+cam.up       = Vector3(0.0f, 1.0f, 0.0f);
+cam.setPerspective(60.0f, 0.1f, 50.0f);
+cam.markDirty();
+
+renderer.setSkyboxWithLighting(SKYBOX_DAY);
+renderer.setShadowsEnabled(true);
+renderer.setShadowPlaneY(0.0f);
+
+// In the main loop:
+renderer.beginFrame();
+
+// draw meshes / instances / FX
+
+renderer.endFrame();
+```
+
+This pattern mirrors common usage in larger engines: a single global renderer
+instance drives all rendering, while world code manipulates cameras, lights and
+instances through its high‑level API.
