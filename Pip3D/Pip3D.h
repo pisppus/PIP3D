@@ -42,9 +42,9 @@
 #include "Scene/SceneGraph.h"
 #include "Scene/CharacterController.h"
 
-#define PIP3D_VERSION_MAJOR 1
-#define PIP3D_VERSION_MINOR 2
-#define PIP3D_VERSION_PATCH 0
+#define PIP3D_VERSION_MAJOR 0
+#define PIP3D_VERSION_MINOR 1
+#define PIP3D_VERSION_PATCH 1
 
 #define PIP3D_STRINGIFY_IMPL(x) #x
 #define PIP3D_STRINGIFY(x) PIP3D_STRINGIFY_IMPL(x)
@@ -105,3 +105,4 @@ namespace pip3D
 }
 
 #endif
+
