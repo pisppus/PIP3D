@@ -11,6 +11,7 @@
 #include "Body.h"
 #include "Contacts.h"
 #include "Constraints.h"
+#include "Buoyancy.h"
 
 namespace pip3D
 {
@@ -31,6 +32,8 @@ namespace pip3D
         float currentDeltaTime;
         std::vector<CollisionInfo> contactConstraints;
         std::vector<CollisionInfo> previousContactConstraints;
+
+        std::vector<BuoyancyZone> waterZones;
 
     public:
         PhysicsWorld()
@@ -76,6 +79,11 @@ namespace pip3D
                     break;
                 }
             }
+        }
+
+        void addBuoyancyZone(const BuoyancyZone &zone)
+        {
+            waterZones.push_back(zone);
         }
 
         void removeBody(RigidBody *body)
@@ -232,9 +240,7 @@ namespace pip3D
                     }
 
                     static const int edges[12][2] = {
-                        {0, 1}, {1, 2}, {2, 3}, {3, 0},
-                        {4, 5}, {5, 6}, {6, 7}, {7, 4},
-                        {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+                        {0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6}, {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
 
                     for (int e = 0; e < 12; ++e)
                     {
@@ -325,6 +331,8 @@ namespace pip3D
 
             size_t bodyCount = bodies.size();
 
+            const float gravityMag = gravity.length();
+
             for (size_t i = 0; i < bodyCount; i++)
             {
                 RigidBody *b = bodies[i];
@@ -332,6 +340,85 @@ namespace pip3D
                 if (!b->isStatic && !b->isSleeping && b->mass > 0.0f)
                 {
                     b->applyForce(gravity * b->mass);
+                }
+            }
+
+            if (!waterZones.empty())
+            {
+                const float effectiveGravity = (gravityMag > 0.0f) ? gravityMag : 9.81f;
+
+                for (size_t i = 0; i < bodyCount; ++i)
+                {
+                    RigidBody *b = bodies[i];
+                    if (!b || b->isStatic || b->isKinematic || b->isSleeping || b->mass <= 0.0f)
+                        continue;
+
+                    // Only box bodies use corner-based buoyancy
+                    if (b->shape != BODY_SHAPE_BOX)
+                        continue;
+
+                    Vector3 half = b->size * 0.5f;
+
+                    // Four local bottom corners in body space
+                    Vector3 localCorners[4] = {
+                        Vector3(-half.x, -half.y, -half.z),
+                        Vector3( half.x, -half.y, -half.z),
+                        Vector3( half.x, -half.y,  half.z),
+                        Vector3(-half.x, -half.y,  half.z)};
+
+                    for (size_t zi = 0; zi < waterZones.size(); ++zi)
+                    {
+                        const BuoyancyZone &zone = waterZones[zi];
+
+                        for (int c = 0; c < 4; ++c)
+                        {
+                            // World-space corner position
+                            Vector3 worldCorner = b->orientation.rotate(localCorners[c]) + b->position;
+
+                            // Must be inside zone volume horizontally (AABB) and below surface
+                            if (!zone.contains(worldCorner))
+                                continue;
+
+                            float depth = zone.surfaceLevel - worldCorner.y;
+                            if (depth <= 0.0f)
+                                continue;
+
+                            // Clamp depth relative to body height for smoother response
+                            float hRef = b->size.y;
+                            if (hRef <= 0.0f)
+                                hRef = 1.0f;
+                            float depthFactor = depth / hRef;
+                            if (depthFactor > 1.0f)
+                                depthFactor = 1.0f;
+
+                            // Per-corner buoyant force (sum of 4 corners approximates total)
+                            float cornerForceMag = (b->mass * zone.density * effectiveGravity * 0.25f) * depthFactor;
+                            Vector3 forceVec(0.0f, cornerForceMag, 0.0f);
+
+                            // Linear part
+                            b->applyForce(forceVec);
+
+                            // Approximate torque from force at corner: tau = r x F
+                            Vector3 r = worldCorner - b->position;
+                            Vector3 tau = r.cross(forceVec);
+                            Vector3 angAcc(
+                                tau.x * b->invInertia.x,
+                                tau.y * b->invInertia.y,
+                                tau.z * b->invInertia.z);
+                            b->angularVelocity += angAcc * deltaTime;
+                        }
+
+                        // Additional damping while inside water zone
+                        float linFactor = 1.0f - zone.dragLinear * deltaTime;
+                        float angFactor = 1.0f - zone.dragAngular * deltaTime;
+                        if (linFactor < 0.0f)
+                            linFactor = 0.0f;
+                        if (angFactor < 0.0f)
+                            angFactor = 0.0f;
+
+                        b->velocity *= linFactor;
+                        b->angularVelocity *= angFactor;
+                    }
                 }
             }
 

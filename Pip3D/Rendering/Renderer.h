@@ -19,6 +19,9 @@
 #include "Rasterizer/Rasterizer.h"
 #include "Rasterizer/Shading.h"
 #include "Display/FrameBuffer.h"
+#include "Display/Drivers/DisplayDriverBase.h"
+#include "Display/Drivers/ST7789Driver.h"
+#include "Display/Drivers/ILI9488Driver.h"
 #include "HUD/HudRenderer.h"
 #include "SceneRendering/Culling.h"
 #include "SceneRendering/MeshRenderer.h"
@@ -42,9 +45,16 @@ namespace pip3D
         static constexpr int TILE_WIDTH = 80;
         static constexpr int TILE_HEIGHT = 60;
 
+        // Banded rendering: horizontal bands for the physical 320x240 screen.
+        static constexpr int BAND_COUNT = SCREEN_BAND_COUNT;
+        static constexpr int BAND_HEIGHT = SCREEN_BAND_HEIGHT;
+
         FrameBuffer framebuffer;
-        ZBuffer<320, 240> *zBuffer;
-        ST7789Driver *display;
+        ZBuffer<SCREEN_WIDTH, SCREEN_BAND_HEIGHT> *zBuffer;
+        DisplayDriverBase *display;
+
+        // Full screen configuration (320x240) separate from banded framebuffer config
+        DisplayConfig screenConfig;
 
         std::vector<Camera> cameras;
         int activeCameraIndex;
@@ -98,6 +108,9 @@ namespace pip3D
 
         bool debugShowDirtyRegions;
 
+        // Current band index for banded rendering (0..BAND_COUNT-1)
+        int currentBandIndex;
+
     public:
         Renderer() : zBuffer(nullptr),
                      display(nullptr),
@@ -108,7 +121,8 @@ namespace pip3D
                      activeLightCount(1),
                      shadowsEnabled(true),
                      backfaceCullingEnabled(true),
-                     occlusionCullingEnabled(true),
+                     // Occlusion culling disabled by default in banded mode
+                     occlusionCullingEnabled(false),
                      shadingMode(SHADING_FLAT),
                      statsTrianglesTotal(0),
                      statsTrianglesBackfaceCulled(0),
@@ -165,11 +179,11 @@ namespace pip3D
 
             if (!display)
             {
-                display = new ST7789Driver();
+                display = new ILI9488Driver();
                 if (!display)
                 {
                     LOGE(::pip3D::Debug::LOG_MODULE_RENDER,
-                         "Renderer::init: failed to allocate ST7789Driver");
+                         "Renderer::init: failed to allocate ILI9488Driver");
                     return false;
                 }
             }
@@ -203,7 +217,14 @@ namespace pip3D
                 return false;
             }
 
-            if (!framebuffer.init(cfg, display))
+            // Store full-screen configuration (e.g., 320x240)
+            screenConfig = cfg;
+
+            // Framebuffer only keeps a single band in memory.
+            DisplayConfig fbCfg = cfg;
+            fbCfg.height = cfg.height / BAND_COUNT;
+
+            if (!framebuffer.init(fbCfg, display))
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RENDER,
                      "Renderer::init: FrameBuffer::init failed for %dx%d",
@@ -214,7 +235,8 @@ namespace pip3D
                 return false;
             }
 
-            zBuffer = new ZBuffer<320, 240>();
+            // Z-buffer also allocated per-band (same dimensions as framebuffer)
+            zBuffer = new ZBuffer<SCREEN_WIDTH, SCREEN_BAND_HEIGHT>();
             if (!zBuffer || !zBuffer->init())
             {
                 if (!zBuffer)
@@ -237,6 +259,7 @@ namespace pip3D
                 return false;
             }
 
+            // Viewport still covers the full screen; projection stays unchanged.
             viewport = Viewport(0, 0, cfg.width, cfg.height);
 
             LOGI(::pip3D::Debug::LOG_MODULE_RENDER,
@@ -248,79 +271,111 @@ namespace pip3D
 
         void beginFrame()
         {
-            perfCounter.begin();
-            framebuffer.beginFrame();
-            zBuffer->clear();
-
-#if ENABLE_DEBUG_DRAW
-            ::pip3D::Debug::DebugDraw::beginFrame();
-#endif
-
-            for (int i = 0; i < MAX_WORLD_DIRTY_INSTANCES; ++i)
-            {
-                worldInstanceDirty[i].hasCurrent = false;
-            }
-
-            hasWorldDirtyRegion = false;
-            hasHudDirtyRegion = false;
-            cameraChangedThisFrame = false;
-            CameraController::updateViewProjectionIfNeeded(cameras[activeCameraIndex],
-                                                           viewport,
-                                                           viewMatrix,
-                                                           projMatrix,
-                                                           viewProjMatrix,
-                                                           frustum,
-                                                           viewProjMatrixDirty,
-                                                           cameraChangedThisFrame);
-
-            statsTrianglesTotal = 0;
-            statsTrianglesBackfaceCulled = 0;
-            statsInstancesTotal = 0;
-            statsInstancesFrustumCulled = 0;
-            statsInstancesOcclusionCulled = 0;
+            // Legacy single-band entry point: render only the first band.
+            beginFrameBand(0);
         }
 
         void endFrame()
         {
-            bool forceFullFrame = false;
-            bool showDirtyOverlay = debugShowDirtyRegions;
-
-#if ENABLE_DEBUG_DRAW
+        #if ENABLE_DEBUG_DRAW
             ::pip3D::Debug::DebugDraw::render(*this);
-#endif
+        #endif
 
-            DirtyRegionHelper::finalizeFrame(framebuffer,
-                                             perfCounter,
-                                             worldInstanceDirty,
-                                             worldDirtyMinX,
-                                             worldDirtyMinY,
-                                             worldDirtyMaxX,
-                                             worldDirtyMaxY,
-                                             lastWorldDirtyMinX,
-                                             lastWorldDirtyMinY,
-                                             lastWorldDirtyMaxX,
-                                             lastWorldDirtyMaxY,
-                                             hasWorldDirtyRegion,
-                                             hasLastWorldDirtyRegion,
-                                             hudDirtyMinX,
-                                             hudDirtyMinY,
-                                             hudDirtyMaxX,
-                                             hudDirtyMaxY,
-                                             hasHudDirtyRegion,
-                                             cameraChangedThisFrame,
-                                             statsTrianglesTotal,
-                                             statsTrianglesBackfaceCulled,
-                                             statsInstancesTotal,
-                                             statsInstancesFrustumCulled,
-                                             statsInstancesOcclusionCulled,
-                                             forceFullFrame,
-                                             showDirtyOverlay);
+            // Legacy single-band exit: flush only current band to the top of the screen.
+            framebuffer.endFrameRegion(0, 0,
+                                       framebuffer.getConfig().width,
+                                       framebuffer.getConfig().height);
+            perfCounter.endFrame();
         }
 
         void endFrameRegion(int16_t x, int16_t y, int16_t w, int16_t h)
         {
             framebuffer.endFrameRegion(x, y, w, h);
             perfCounter.endFrame();
+        }
+
+        // Banded rendering API: render a specific horizontal band (0..BAND_COUNT-1).
+        void beginFrameBand(int bandIndex)
+        {
+            if (bandIndex < 0)
+                bandIndex = 0;
+            if (bandIndex >= BAND_COUNT)
+                bandIndex = BAND_COUNT - 1;
+
+            currentBandIndex = bandIndex;
+
+            // Update global band state (used by rasterizer, mesh renderer, shadows, etc.).
+            int16_t bandTop = static_cast<int16_t>(bandIndex * BAND_HEIGHT);
+            currentBandOffsetY() = bandTop;
+            currentBandHeight() = BAND_HEIGHT;
+
+            // Only once per full frame, on the first band
+            if (bandIndex == 0)
+            {
+                perfCounter.begin();
+
+                for (int i = 0; i < MAX_WORLD_DIRTY_INSTANCES; ++i)
+                {
+                    worldInstanceDirty[i].hasCurrent = false;
+                    worldInstanceDirty[i].hasLast = false;
+                    worldInstanceDirty[i].instance = nullptr;
+                }
+
+                hasWorldDirtyRegion = false;
+                hasLastWorldDirtyRegion = false;
+                hasHudDirtyRegion = false;
+                cameraChangedThisFrame = false;
+
+                CameraController::updateViewProjectionIfNeeded(cameras[activeCameraIndex],
+                                                               viewport,
+                                                               viewMatrix,
+                                                               projMatrix,
+                                                               viewProjMatrix,
+                                                               frustum,
+                                                               viewProjMatrixDirty,
+                                                               cameraChangedThisFrame);
+
+                statsTrianglesTotal = 0;
+                statsTrianglesBackfaceCulled = 0;
+                statsInstancesTotal = 0;
+                statsInstancesFrustumCulled = 0;
+                statsInstancesOcclusionCulled = 0;
+            }
+
+            framebuffer.beginFrame();
+            if (zBuffer)
+                zBuffer->clear();
+
+        #if ENABLE_DEBUG_DRAW
+            ::pip3D::Debug::DebugDraw::beginFrame();
+        #endif
+        }
+
+        void endFrameBand(int bandIndex)
+        {
+            if (bandIndex < 0)
+                bandIndex = 0;
+            if (bandIndex >= BAND_COUNT)
+                bandIndex = BAND_COUNT - 1;
+
+            const DisplayConfig &fbCfg = framebuffer.getConfig();
+            int16_t bandY = static_cast<int16_t>(bandIndex * fbCfg.height);
+
+            framebuffer.endFrameRegion(0, bandY, fbCfg.width, fbCfg.height);
+
+            // Finish performance counter after the last band is flushed
+            if (bandIndex == BAND_COUNT - 1)
+            {
+                perfCounter.endFrame();
+            }
+        }
+
+        // Explicit skybox/background pass: call this after opaque world
+        // geometry has been rendered and ZBuffer filled, but before
+        // transparent overlays (water, HUD) so they remain on top.
+        void drawSkyboxBackground()
+        {
+            framebuffer.drawSkyboxWhereEmpty(*zBuffer);
         }
 
         Vector3 project(const Vector3 &v)
@@ -396,6 +451,81 @@ namespace pip3D
                     {
                         fb[yy * cfg.width + xx] = color.rgb565;
                     }
+                }
+            }
+        }
+
+        void drawWater(float yLevel, float size, Color color, float alpha, float time)
+        {
+            uint16_t *fb = framebuffer.getBuffer();
+            if (!fb || !zBuffer)
+            {
+                return;
+            }
+
+            if (alpha <= 0.0f)
+            {
+                return;
+            }
+            if (alpha > 1.0f)
+            {
+                alpha = 1.0f;
+            }
+
+            const uint8_t alphaByte = static_cast<uint8_t>(alpha * 255.0f);
+            const DisplayConfig &cfg = framebuffer.getConfig();
+
+            Camera &cam = cameras[activeCameraIndex];
+
+            // Mark the full world region as dirty since water animates every frame
+            addDirtyRect(nullptr, 0, 0, cfg.width, cfg.height);
+
+            // Frustum cull: simple sphere around water patch
+            const Vector3 center(0.0f, yLevel, 0.0f);
+            const float radius = size * 0.75f;
+            if (!frustum.sphere(center, radius))
+            {
+                return;
+            }
+
+            const int GRID = 32;
+            const float half = size * 0.5f;
+            const float step = size / static_cast<float>(GRID);
+
+            const float freq = 0.6f;
+            const float amp = size * 0.02f;
+
+            for (int iz = 0; iz < GRID; ++iz)
+            {
+                float z0 = -half + step * static_cast<float>(iz);
+                float z1 = z0 + step;
+
+                for (int ix = 0; ix < GRID; ++ix)
+                {
+                    float x0 = -half + step * static_cast<float>(ix);
+                    float x1 = x0 + step;
+
+                    Vector3 v00(x0,
+                                yLevel + FastMath::fastSin(x0 * freq + time) * amp +
+                                    FastMath::fastCos(z0 * freq + time) * amp,
+                                z0);
+                    Vector3 v10(x1,
+                                yLevel + FastMath::fastSin(x1 * freq + time) * amp +
+                                    FastMath::fastCos(z0 * freq + time) * amp,
+                                z0);
+                    Vector3 v01(x0,
+                                yLevel + FastMath::fastSin(x0 * freq + time) * amp +
+                                    FastMath::fastCos(z1 * freq + time) * amp,
+                                z1);
+                    Vector3 v11(x1,
+                                yLevel + FastMath::fastSin(x1 * freq + time) * amp +
+                                    FastMath::fastCos(z1 * freq + time) * amp,
+                                z1);
+
+                    // Triangle 1
+                    drawWaterTriangleInternal(v00, v10, v11, color, alphaByte, cam, cfg, fb);
+                    // Triangle 2
+                    drawWaterTriangleInternal(v00, v11, v01, color, alphaByte, cam, cfg, fb);
                 }
             }
         }
@@ -616,6 +746,31 @@ namespace pip3D
                 }
             }
 
+            // Contribution culling: skip instances that project to < 1 pixel
+            // on screen for perspective cameras.
+            const Camera &cam = cameras[activeCameraIndex];
+            if (cam.projectionType == PERSPECTIVE)
+            {
+                Vector3 toCenter = center - cam.position;
+                float distForward = toCenter.dot(cam.forward());
+                if (distForward > cam.nearPlane)
+                {
+                    float fovRad = cam.fov * DEG2RAD;
+                    float tanHalf = tanf(fovRad * 0.5f);
+                    if (tanHalf > 1e-6f)
+                    {
+                        float projScale = 1.0f / tanHalf;
+                        float radiusPixels = fabsf(radius * projScale / distForward) *
+                                             (static_cast<float>(viewport.height) * 0.5f);
+                        if (radiusPixels < 1.0f)
+                        {
+                            statsInstancesTotal++;
+                            return;
+                        }
+                    }
+                }
+            }
+
             statsInstancesTotal++;
 
             if (occlusionCullingEnabled &&
@@ -797,6 +952,93 @@ namespace pip3D
             int16_t y1 = (int16_t)(pc.y + rScr + 1.0f);
 
             addDirtyRect(instance, x0, y0, x1 - x0, y1 - y0);
+        }
+
+        __attribute__((always_inline)) inline void drawWaterTriangleInternal(const Vector3 &v0,
+                                                                             const Vector3 &v1,
+                                                                             const Vector3 &v2,
+                                                                             const Color &waterColor,
+                                                                             uint8_t alphaByte,
+                                                                             const Camera &cam,
+                                                                             const DisplayConfig &cfg,
+                                                                             uint16_t *frameBufferPtr)
+        {
+            Vector3 p0 = CameraController::project(v0, viewProjMatrix, viewport);
+            Vector3 p1 = CameraController::project(v1, viewProjMatrix, viewport);
+            Vector3 p2 = CameraController::project(v2, viewProjMatrix, viewport);
+
+            float x0 = p0.x, y0 = p0.y, z0 = p0.z;
+            float x1 = p1.x, y1 = p1.y, z1 = p1.z;
+            float x2 = p2.x, y2 = p2.y, z2 = p2.z;
+
+            float minXf = fminf(x0, fminf(x1, x2));
+            float maxXf = fmaxf(x0, fmaxf(x1, x2));
+            float minYf = fminf(y0, fminf(y1, y2));
+            float maxYf = fmaxf(y0, fmaxf(y1, y2));
+
+            int16_t minX = static_cast<int16_t>(floorf(minXf));
+            int16_t maxX = static_cast<int16_t>(ceilf(maxXf));
+            int16_t minY = static_cast<int16_t>(floorf(minYf));
+            int16_t maxY = static_cast<int16_t>(ceilf(maxYf));
+
+            // Clip to full screen bounds first.
+            if (maxX < 0 || maxY < 0 || minX >= (int16_t)SCREEN_WIDTH || minY >= (int16_t)SCREEN_HEIGHT)
+            {
+                return;
+            }
+
+            if (minX < 0)
+                minX = 0;
+            if (minY < 0)
+                minY = 0;
+            if (maxX >= (int16_t)SCREEN_WIDTH)
+                maxX = (int16_t)SCREEN_WIDTH - 1;
+            if (maxY >= (int16_t)SCREEN_HEIGHT)
+                maxY = (int16_t)SCREEN_HEIGHT - 1;
+
+            // Then clip to current band vertically.
+            int16_t bandTop = currentBandOffsetY();
+            int16_t bandH = currentBandHeight();
+            int16_t bandBottom = static_cast<int16_t>(bandTop + bandH);
+
+            if (maxY < bandTop || minY >= bandBottom)
+            {
+                return;
+            }
+
+            if (minY < bandTop)
+                minY = bandTop;
+            if (maxY >= bandBottom)
+                maxY = static_cast<int16_t>(bandBottom - 1);
+
+            float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+            if (fabsf(denom) < 1e-6f)
+            {
+                return;
+            }
+            float invDenom = 1.0f / denom;
+
+            for (int16_t y = minY; y <= maxY; ++y)
+            {
+                float py = static_cast<float>(y) + 0.5f;
+                int16_t yLocal = static_cast<int16_t>(y - bandTop);
+
+                for (int16_t x = minX; x <= maxX; ++x)
+                {
+                    float px = static_cast<float>(x) + 0.5f;
+
+                    float w0 = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) * invDenom;
+                    float w1 = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) * invDenom;
+                    float w2 = 1.0f - w0 - w1;
+
+                    if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f)
+                        continue;
+
+                    uint16_t &dst = frameBufferPtr[yLocal * cfg.width + x];
+                    Color bg(dst);
+                    dst = bg.blend(waterColor, alphaByte).rgb565;
+                }
+            }
         }
 
         ~Renderer()

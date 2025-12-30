@@ -9,6 +9,17 @@
 #include <esp_heap_caps.h>
 #include "../../../Core/Core.h"
 #include "DisplayConfig.h"
+#include "DisplayDriverBase.h"
+
+#ifndef TFT_MOSI
+#define TFT_MOSI 7
+#endif
+#ifndef TFT_MISO
+#define TFT_MISO -1
+#endif
+#ifndef TFT_SCLK
+#define TFT_SCLK 17
+#endif
 
 namespace pip3D
 {
@@ -33,7 +44,7 @@ namespace pip3D
     static constexpr size_t DMA_CHUNK_PIXELS = DMA_CHUNK_SIZE / 2;
     static constexpr size_t SMALL_BUFFER_THRESHOLD = 2046;
 
-    class alignas(16) ST7789Driver
+    class alignas(16) ST7789Driver : public DisplayDriverBase
     {
     private:
         spi_device_handle_t spi_device;
@@ -53,6 +64,9 @@ namespace pip3D
 
         alignas(16) uint16_t *swapBuffer;
         size_t swapBufferSize;
+
+        spi_transaction_t asyncTrans;
+        bool asyncInFlight;
 
         __attribute__((always_inline)) inline void CS_LOW()
         {
@@ -116,10 +130,15 @@ namespace pip3D
     public:
         ST7789Driver() : spi_device(nullptr), cs_pin(-1), dc_pin(-1), rst_pin(-1), bl_pin(-1),
                          cs_mask(0), dc_mask(0), width(240), height(320), rotation(0),
-                         dmaBuffer(nullptr), dmaBufferSize(0), swapBuffer(nullptr), swapBufferSize(0) {}
+                         dmaBuffer(nullptr), dmaBufferSize(0), swapBuffer(nullptr), swapBufferSize(0),
+                         asyncInFlight(false) {}
 
         ~ST7789Driver()
         {
+            if (asyncInFlight)
+            {
+                waitDMA();
+            }
             if (dmaBuffer)
             {
                 heap_caps_free(dmaBuffer);
@@ -138,7 +157,22 @@ namespace pip3D
             }
         }
 
-        bool init(const LCD &config = LCD())
+        void waitDMA()
+        {
+            if (!spi_device || !asyncInFlight)
+                return;
+
+            spi_transaction_t *retTrans = nullptr;
+            esp_err_t ret = spi_device_get_trans_result(spi_device, &retTrans, portMAX_DELAY);
+            (void)retTrans;
+            if (ret == ESP_OK)
+            {
+                asyncInFlight = false;
+            }
+            CS_HIGH();
+        }
+
+        bool init(const LCD &config = LCD()) override
         {
             if (dmaBuffer)
             {
@@ -199,9 +233,9 @@ namespace pip3D
             }
 
             spi_bus_config_t buscfg = {};
-            buscfg.mosi_io_num = 7;
-            buscfg.miso_io_num = -1;
-            buscfg.sclk_io_num = 17;
+            buscfg.mosi_io_num = TFT_MOSI;
+            buscfg.miso_io_num = TFT_MISO;
+            buscfg.sclk_io_num = TFT_SCLK;
             buscfg.quadwp_io_num = -1;
             buscfg.quadhd_io_num = -1;
             buscfg.max_transfer_sz = 320 * 240 * 2 + 8;
@@ -261,17 +295,13 @@ namespace pip3D
             setRotation(3);
 
             dmaBufferSize = width * 16;
-            dmaBuffer = (uint16_t *)heap_caps_malloc(dmaBufferSize * sizeof(uint16_t), MALLOC_CAP_DMA);
+            dmaBuffer = (uint16_t *)heap_caps_malloc(dmaBufferSize * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
             if (!dmaBuffer)
             {
-                dmaBuffer = (uint16_t *)malloc(dmaBufferSize * sizeof(uint16_t));
-                if (!dmaBuffer)
-                {
-                    LOGE(::pip3D::Debug::LOG_MODULE_RENDER,
-                         "ST7789Driver DMA buffer alloc failed (size=%u)",
-                         (unsigned int)(dmaBufferSize * sizeof(uint16_t)));
-                    return false;
-                }
+                LOGE(::pip3D::Debug::LOG_MODULE_RENDER,
+                     "ST7789Driver DMA buffer alloc failed (size=%u)",
+                     (unsigned int)(dmaBufferSize * sizeof(uint16_t)));
+                return false;
             }
 
             LOGI(::pip3D::Debug::LOG_MODULE_RENDER,
@@ -322,11 +352,7 @@ namespace pip3D
                 {
                     if (swapBuffer)
                         heap_caps_free(swapBuffer);
-                    swapBuffer = (uint16_t *)heap_caps_malloc(chunk * sizeof(uint16_t), MALLOC_CAP_DMA);
-                    if (!swapBuffer)
-                    {
-                        swapBuffer = (uint16_t *)malloc(chunk * sizeof(uint16_t));
-                    }
+                    swapBuffer = (uint16_t *)heap_caps_malloc(chunk * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
                     if (!swapBuffer)
                     {
                         CS_HIGH();
@@ -444,11 +470,7 @@ namespace pip3D
                     {
                         if (swapBuffer)
                             heap_caps_free(swapBuffer);
-                        swapBuffer = (uint16_t *)heap_caps_malloc(totalPixels * sizeof(uint16_t), MALLOC_CAP_DMA);
-                        if (!swapBuffer)
-                        {
-                            swapBuffer = (uint16_t *)malloc(totalPixels * sizeof(uint16_t));
-                        }
+                        swapBuffer = (uint16_t *)heap_caps_malloc(totalPixels * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
                         if (!swapBuffer)
                         {
                             CS_HIGH();
@@ -498,7 +520,92 @@ namespace pip3D
             fillRect(0, 0, width, height, color);
         }
 
-        __attribute__((hot)) void pushImage(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t *buffer)
+        void pushImageAsync(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t *buffer)
+        {
+            if (!buffer || w <= 0 || h <= 0)
+                return;
+
+            if (asyncInFlight)
+            {
+                waitDMA();
+            }
+
+            if (x >= width || y >= height || x + w <= 0 || y + h <= 0)
+                return;
+
+            int16_t x_start = (x < 0) ? 0 : x;
+            int16_t y_start = (y < 0) ? 0 : y;
+            int16_t x_end = (x + w > width) ? width : (x + w);
+            int16_t y_end = (y + h > height) ? height : (y + h);
+
+            w = x_end - x_start;
+            h = y_end - y_start;
+
+            if (w <= 0 || h <= 0)
+                return;
+
+            setAddrWindow(x_start, y_start, x_end - 1, y_end - 1);
+
+            size_t totalPixels = (size_t)w * h;
+
+            if (!swapBuffer || swapBufferSize < totalPixels)
+            {
+                if (asyncInFlight)
+                {
+                    waitDMA();
+                }
+
+                if (swapBuffer)
+                {
+                    heap_caps_free(swapBuffer);
+                    swapBuffer = nullptr;
+                    swapBufferSize = 0;
+                }
+
+                size_t bytes = totalPixels * sizeof(uint16_t);
+                swapBuffer = (uint16_t *)heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+                if (!swapBuffer)
+                {
+                    return;
+                }
+                swapBufferSize = totalPixels;
+            }
+
+            uint32_t *src32 = (uint32_t *)(buffer + (size_t)y_start * width + x_start);
+            uint32_t *dst32 = (uint32_t *)swapBuffer;
+            size_t chunks32 = totalPixels / 2;
+
+            for (size_t i = 0; i < chunks32; i++)
+            {
+                uint32_t val = src32[i];
+                dst32[i] = ((val & 0x00FF00FF) << 8) | ((val & 0xFF00FF00) >> 8);
+            }
+
+            if (totalPixels & 1)
+            {
+                uint16_t pixel = buffer[(size_t)y_start * width + x_start + (totalPixels - 1)];
+                swapBuffer[totalPixels - 1] = (pixel >> 8) | (pixel << 8);
+            }
+
+            DC_HIGH();
+            CS_LOW();
+
+            memset(&asyncTrans, 0, sizeof(asyncTrans));
+            asyncTrans.length = totalPixels * 16;
+            asyncTrans.tx_buffer = swapBuffer;
+            asyncTrans.flags = 0;
+
+            esp_err_t qret = spi_device_queue_trans(spi_device, &asyncTrans, portMAX_DELAY);
+            if (qret != ESP_OK)
+            {
+                CS_HIGH();
+                return;
+            }
+
+            asyncInFlight = true;
+        }
+
+        __attribute__((hot)) void pushImage(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t *buffer) override
         {
             if (x == 0 && y == 0 && w == width && h == height)
             {
@@ -518,7 +625,7 @@ namespace pip3D
                         heap_caps_free(swapBuffer);
 
                     size_t bytes = requiredPixels * sizeof(uint16_t);
-                    swapBuffer = (uint16_t *)heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_DMA);
+                    swapBuffer = (uint16_t *)heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
                     if (!swapBuffer)
                     {
                         LOGE(::pip3D::Debug::LOG_MODULE_RENDER,
@@ -641,7 +748,10 @@ namespace pip3D
 
             for (int16_t row = 0; row < h; row++)
             {
-                uint16_t *rowPtr = buffer + ((y_start + row) * width + x_start);
+                // In partial update mode, the source buffer is treated as a
+                // tightly packed rectangle of size w x h starting at (0, 0).
+                // Each row is contiguous and has exactly w pixels.
+                uint16_t *rowPtr = buffer + ((size_t)row * (size_t)w);
 
                 size_t rowPixels = (size_t)w;
 
@@ -649,11 +759,7 @@ namespace pip3D
                 {
                     if (swapBuffer)
                         heap_caps_free(swapBuffer);
-                    swapBuffer = (uint16_t *)heap_caps_malloc(rowPixels * sizeof(uint16_t), MALLOC_CAP_DMA);
-                    if (!swapBuffer)
-                    {
-                        swapBuffer = (uint16_t *)malloc(rowPixels * sizeof(uint16_t));
-                    }
+                    swapBuffer = (uint16_t *)heap_caps_malloc(rowPixels * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
                     if (!swapBuffer)
                     {
                         CS_HIGH();
@@ -754,8 +860,8 @@ namespace pip3D
             sendCmdData(ST7789_MADCTL, &madctl, 1);
         }
 
-        __attribute__((always_inline)) inline uint16_t getWidth() const { return width; }
-        __attribute__((always_inline)) inline uint16_t getHeight() const { return height; }
+        __attribute__((always_inline)) inline uint16_t getWidth() const override { return width; }
+        __attribute__((always_inline)) inline uint16_t getHeight() const override { return height; }
     };
 
 }

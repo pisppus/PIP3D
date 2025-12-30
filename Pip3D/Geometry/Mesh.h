@@ -18,12 +18,6 @@ static constexpr float INV_255 = 1.0f / 255.0f;
 static constexpr float SCALE_255 = 255.0f;
 static constexpr float EPSILON_SQ = 1e-12f;
 
-static constexpr float POSITION_Q_MIN = -32.0f;
-static constexpr float POSITION_Q_MAX = 32.0f;
-static constexpr float POSITION_Q_RANGE = POSITION_Q_MAX - POSITION_Q_MIN;
-static constexpr float POSITION_Q_ENCODE_SCALE = 65535.0f / POSITION_Q_RANGE;
-static constexpr float POSITION_Q_DECODE_SCALE = POSITION_Q_RANGE / 65535.0f;
-
 namespace pip3D
 {
 
@@ -78,7 +72,7 @@ namespace pip3D
 
     struct Vertex
     {
-        uint16_t px, py, pz;
+        int16_t px, py, pz;
         PackedNormal normal;
 
         MESH_FORCE_INLINE Vertex() : px(0), py(0), pz(0), normal() {}
@@ -126,30 +120,25 @@ namespace pip3D
         bool castShadows;
         mutable bool transformDirty;
 
+        bool isStaticStorage;
+
+        float qScale;
+
         mutable MeshCache cache;
 
     public:
         MESH_HOT_PATH Mesh(uint16_t maxVerts = 64, uint16_t maxFcs = 128, const Color &color = Color::WHITE)
             : vertexCount(0), faceCount(0), maxVertices(maxVerts), maxFaces(maxFcs),
               position(0, 0, 0), rotation(0, 0, 0), scale(1, 1, 1),
-              meshColor(color), visible(true), castShadows(true), transformDirty(true)
+              meshColor(color), visible(true), castShadows(true), transformDirty(true),
+              isStaticStorage(false), qScale(1.0f)
         {
-
-            static const bool hasPSRAM = psramFound();
 
             const size_t vertexSize = maxVertices * sizeof(Vertex);
             const size_t faceSize = maxFaces * sizeof(Face);
 
-            if (hasPSRAM)
-            {
-                vertices = (Vertex *)heap_caps_aligned_alloc(16, vertexSize, MALLOC_CAP_SPIRAM);
-                faces = (Face *)heap_caps_aligned_alloc(16, faceSize, MALLOC_CAP_SPIRAM);
-            }
-            else
-            {
-                vertices = (Vertex *)heap_caps_aligned_alloc(16, vertexSize, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-                faces = (Face *)heap_caps_aligned_alloc(16, faceSize, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-            }
+            vertices = (Vertex *)MemUtils::allocData(vertexSize, 16);
+            faces = (Face *)MemUtils::allocData(faceSize, 16);
 
             if (unlikely(!vertices || !faces))
             {
@@ -166,36 +155,68 @@ namespace pip3D
             cache.transform.identity();
         }
 
-        MESH_FORCE_INLINE static uint16_t quantizeCoord(float x)
+        MESH_HOT_PATH Mesh(const Vertex *externalVertices,
+                           uint16_t vertCount,
+                           const Face *externalFaces,
+                           uint16_t faceCountIn,
+                           const Color &color = Color::WHITE,
+                           bool staticStorage = true)
+            : vertices(const_cast<Vertex *>(externalVertices)),
+              faces(const_cast<Face *>(externalFaces)),
+              vertexCount(vertCount), faceCount(faceCountIn),
+              maxVertices(vertCount), maxFaces(faceCountIn),
+              position(0, 0, 0), rotation(0, 0, 0), scale(1, 1, 1),
+              meshColor(color), visible(true), castShadows(true), transformDirty(true),
+              isStaticStorage(staticStorage), qScale(1.0f)
         {
-            float clamped = fminf(fmaxf(x, POSITION_Q_MIN), POSITION_Q_MAX);
-            float q = (clamped - POSITION_Q_MIN) * POSITION_Q_ENCODE_SCALE + 0.5f;
-            return static_cast<uint16_t>(q);
+            cache.transform.identity();
         }
 
-        MESH_FORCE_INLINE static float dequantizeCoord(uint16_t q)
+        MESH_FORCE_INLINE void autoScale(float size)
         {
-            return POSITION_Q_MIN + static_cast<float>(q) * POSITION_Q_DECODE_SCALE;
+            if (size <= 0.0f)
+            {
+                qScale = 1.0f;
+                return;
+            }
+            const float half = size * 0.5f;
+            const float denom = 32767.0f;
+            qScale = half / denom;
+        }
+
+        MESH_FORCE_INLINE int16_t quantizeCoord(float x) const
+        {
+            if (qScale <= 0.0f)
+            {
+                return 0;
+            }
+            float q = x / qScale;
+            float clamped = fminf(fmaxf(q, -32768.0f), 32767.0f);
+            if (clamped >= 0.0f)
+                clamped += 0.5f;
+            else
+                clamped -= 0.5f;
+            return static_cast<int16_t>(clamped);
         }
 
         MESH_PURE MESH_FORCE_INLINE Vector3 decodePosition(const Vertex &v) const
         {
             return Vector3(
-                dequantizeCoord(v.px),
-                dequantizeCoord(v.py),
-                dequantizeCoord(v.pz));
+                static_cast<float>(v.px) * qScale,
+                static_cast<float>(v.py) * qScale,
+                static_cast<float>(v.pz) * qScale);
         }
 
         MESH_COLD_PATH void cleanup()
         {
-            if (vertices)
+            if (vertices && !isStaticStorage)
             {
-                heap_caps_free(vertices);
+                MemUtils::freeData(vertices);
                 vertices = nullptr;
             }
-            if (faces)
+            if (faces && !isStaticStorage)
             {
-                heap_caps_free(faces);
+                MemUtils::freeData(faces);
                 faces = nullptr;
             }
             vertexCount = 0;
@@ -215,6 +236,12 @@ namespace pip3D
 
         MESH_HOT_PATH MESH_FORCE_INLINE uint16_t addVertex(const Vector3 &pos)
         {
+            if (unlikely(isStaticStorage))
+            {
+                LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
+                     "Mesh::addVertex called on static-storage mesh");
+                return 0xFFFF;
+            }
             if (unlikely(!vertices || vertexCount >= maxVertices))
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
@@ -237,6 +264,12 @@ namespace pip3D
 
         MESH_HOT_PATH MESH_FORCE_INLINE bool addFace(uint16_t v0, uint16_t v1, uint16_t v2)
         {
+            if (unlikely(isStaticStorage))
+            {
+                LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
+                     "Mesh::addFace called on static-storage mesh");
+                return false;
+            }
             if (unlikely(!faces || !vertices))
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
@@ -270,6 +303,12 @@ namespace pip3D
 
         MESH_HOT_PATH void finalizeNormals()
         {
+            if (unlikely(isStaticStorage))
+            {
+                LOGW(::pip3D::Debug::LOG_MODULE_RESOURCES,
+                     "Mesh::finalizeNormals skipped for static-storage mesh");
+                return;
+            }
             if (unlikely(!vertices || !faces))
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,

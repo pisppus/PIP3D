@@ -38,13 +38,29 @@ namespace pip3D
                                                       const Viewport &viewport,
                                                       const Matrix4x4 &viewProjMatrix,
                                                       FrameBuffer &framebuffer,
-                                                      ZBuffer<320, 240> *zBuffer,
+                                                      ZBuffer<SCREEN_WIDTH, SCREEN_BAND_HEIGHT> *zBuffer,
                                                       const Light *lights,
                                                       int activeLightCount,
                                                       bool backfaceCullingEnabled,
                                                       uint32_t &statsTrianglesTotal,
                                                       uint32_t &statsTrianglesBackfaceCulled)
         {
+            int16_t bandTop = currentBandOffsetY();
+            int16_t bandH = currentBandHeight();
+            int16_t bandBottom = static_cast<int16_t>(bandTop + bandH);
+
+            float minY = fminf(p0.y, fminf(p1.y, p2.y));
+            float maxY = fmaxf(p0.y, fmaxf(p1.y, p2.y));
+            if (maxY < bandTop || minY >= bandBottom)
+                return;
+
+            Vector3 lp0 = p0;
+            Vector3 lp1 = p1;
+            Vector3 lp2 = p2;
+            lp0.y -= (float)bandTop;
+            lp1.y -= (float)bandTop;
+            lp2.y -= (float)bandTop;
+
             Vector3 edge1 = v1 - v0;
             Vector3 edge2 = v2 - v0;
             Vector3 normal = edge1.cross(edge2);
@@ -65,11 +81,11 @@ namespace pip3D
                                        baseR, baseG, baseB,
                                        finalR, finalG, finalB);
 
-            uint16_t shadedColor = Shading::applyDithering(finalR, finalG, finalB, (int16_t)p0.x, (int16_t)p0.y);
+            uint16_t shadedColor = Shading::applyDithering(finalR, finalG, finalB, (int16_t)lp0.x, (int16_t)lp0.y);
 
-            Rasterizer::fillTriangle((int16_t)p0.x, (int16_t)p0.y, p0.z,
-                                     (int16_t)p1.x, (int16_t)p1.y, p1.z,
-                                     (int16_t)p2.x, (int16_t)p2.y, p2.z,
+            Rasterizer::fillTriangle((int16_t)lp0.x, (int16_t)lp0.y, lp0.z,
+                                     (int16_t)lp1.x, (int16_t)lp1.y, lp1.z,
+                                     (int16_t)lp2.x, (int16_t)lp2.y, lp2.z,
                                      shadedColor,
                                      framebuffer.getBuffer(),
                                      zBuffer,
@@ -84,7 +100,7 @@ namespace pip3D
                                          const Viewport &viewport,
                                          const Matrix4x4 &viewProjMatrix,
                                          FrameBuffer &framebuffer,
-                                         ZBuffer<320, 240> *zBuffer,
+                                         ZBuffer<SCREEN_WIDTH, SCREEN_BAND_HEIGHT> *zBuffer,
                                          const Light *lights,
                                          int activeLightCount,
                                          bool backfaceCullingEnabled,
@@ -115,7 +131,7 @@ namespace pip3D
                                                         const Viewport &viewport,
                                                         const Matrix4x4 &viewProjMatrix,
                                                         FrameBuffer &framebuffer,
-                                                        ZBuffer<320, 240> *zBuffer,
+                                                        ZBuffer<SCREEN_WIDTH, SCREEN_BAND_HEIGHT> *zBuffer,
                                                         const Light *lights,
                                                         int activeLightCount,
                                                         bool backfaceCullingEnabled,
@@ -181,7 +197,7 @@ namespace pip3D
                                            const Viewport &viewport,
                                            const Matrix4x4 &viewProjMatrix,
                                            FrameBuffer &framebuffer,
-                                           ZBuffer<320, 240> *zBuffer,
+                                           ZBuffer<SCREEN_WIDTH, SCREEN_BAND_HEIGHT> *zBuffer,
                                            const Light *lights,
                                            int activeLightCount,
                                            bool backfaceCullingEnabled,
@@ -305,7 +321,7 @@ namespace pip3D
                                    const Viewport &viewport,
                                    const Matrix4x4 &viewProjMatrix,
                                    FrameBuffer &framebuffer,
-                                   ZBuffer<320, 240> *zBuffer,
+                                   ZBuffer<SCREEN_WIDTH, SCREEN_BAND_HEIGHT> *zBuffer,
                                    const Light *lights,
                                    int activeLightCount,
                                    bool backfaceCullingEnabled,
@@ -333,7 +349,7 @@ namespace pip3D
                              const Frustum &frustum,
                              const Matrix4x4 &viewProjMatrix,
                              FrameBuffer &framebuffer,
-                             ZBuffer<320, 240> *zBuffer,
+                             ZBuffer<SCREEN_WIDTH, SCREEN_BAND_HEIGHT> *zBuffer,
                              const Light *lights,
                              int activeLightCount,
                              bool backfaceCullingEnabled,
@@ -412,23 +428,28 @@ namespace pip3D
                 const Vector3 &v1 = worldVerts[i1];
                 const Vector3 &v2 = worldVerts[i2];
 
+                const Vector3 &p0 = screenVerts[i0];
+                const Vector3 &p1 = screenVerts[i1];
+                const Vector3 &p2 = screenVerts[i2];
+
                 statsTrianglesTotal++;
                 if (backfaceCullingEnabled)
                 {
-                    Vector3 edge1 = v1 - v0;
-                    Vector3 edge2 = v2 - v0;
-                    Vector3 normal = edge1.cross(edge2);
-                    Vector3 viewDir = camera.position - v0;
-                    if (normal.dot(viewDir) <= 0.0f)
+                    // 2D screen-space backface culling using winding order.
+                    // Screen Y grows downward, so front-facing triangles have
+                    // negative signed area in this coordinate system.
+                    float x0 = p0.x, y0 = p0.y;
+                    float x1 = p1.x, y1 = p1.y;
+                    float x2 = p2.x, y2 = p2.y;
+                    float area2 = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+
+                    // Cull backfacing or degenerate triangles
+                    if (area2 >= 0.0f)
                     {
                         statsTrianglesBackfaceCulled++;
                         continue;
                     }
                 }
-
-                const Vector3 &p0 = screenVerts[i0];
-                const Vector3 &p1 = screenVerts[i1];
-                const Vector3 &p2 = screenVerts[i2];
 
                 drawTriangle3D_Clipped_Preprojected(v0, v1, v2,
                                                     p0, p1, p2,

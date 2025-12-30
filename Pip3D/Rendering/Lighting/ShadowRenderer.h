@@ -43,7 +43,7 @@ namespace pip3D
                                    const Matrix4x4 &viewProjMatrix,
                                    const Viewport &viewport,
                                    FrameBuffer &framebuffer,
-                                   ZBuffer<320, 240> *zBuffer,
+                                   ZBuffer<SCREEN_WIDTH, SCREEN_BAND_HEIGHT> *zBuffer,
                                    bool &backfaceCullingEnabled)
         {
             if (!mesh || !mesh->isVisible() || !shadowsEnabled || !shadowSettings.enabled)
@@ -186,9 +186,25 @@ namespace pip3D
                     p2.z -= depthBias;
                 }
 
-                Rasterizer::fillShadowTriangle(p0.x, p0.y, p0.z,
-                                               p1.x, p1.y, p1.z,
-                                               p2.x, p2.y, p2.z,
+                int16_t bandTop = currentBandOffsetY();
+                int16_t bandH = currentBandHeight();
+                int16_t bandBottom = static_cast<int16_t>(bandTop + bandH);
+
+                float minY = fminf(p0.y, fminf(p1.y, p2.y));
+                float maxY = fmaxf(p0.y, fmaxf(p1.y, p2.y));
+                if (maxY < bandTop || minY >= bandBottom)
+                    continue;
+
+                Vector3 lp0 = p0;
+                Vector3 lp1 = p1;
+                Vector3 lp2 = p2;
+                lp0.y -= (float)bandTop;
+                lp1.y -= (float)bandTop;
+                lp2.y -= (float)bandTop;
+
+                Rasterizer::fillShadowTriangle((int16_t)lp0.x, (int16_t)lp0.y, lp0.z,
+                                               (int16_t)lp1.x, (int16_t)lp1.y, lp1.z,
+                                               (int16_t)lp2.x, (int16_t)lp2.y, lp2.z,
                                                shadowColor,
                                                baseAlpha,
                                                framebuffer.getBuffer(),
@@ -209,7 +225,7 @@ namespace pip3D
                                            const Matrix4x4 &viewProjMatrix,
                                            const Viewport &viewport,
                                            FrameBuffer &framebuffer,
-                                           ZBuffer<320, 240> *zBuffer,
+                                           ZBuffer<SCREEN_WIDTH, SCREEN_BAND_HEIGHT> *zBuffer,
                                            bool &backfaceCullingEnabled)
         {
             if (!instance || !instance->isVisible() || !shadowsEnabled || !shadowSettings.enabled)

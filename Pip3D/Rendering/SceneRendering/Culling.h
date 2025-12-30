@@ -21,7 +21,7 @@ namespace pip3D
                                                  const Camera &camera,
                                                  const Viewport &viewport,
                                                  const Matrix4x4 &viewProjMatrix,
-                                                 ZBuffer<320, 240> *zBuffer,
+                                                 ZBuffer<SCREEN_WIDTH, SCREEN_BAND_HEIGHT> *zBuffer,
                                                  const DisplayConfig &cfg)
         {
             if (!zBuffer || radius <= 0.0f)

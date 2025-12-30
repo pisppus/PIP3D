@@ -11,6 +11,8 @@ namespace pip3D
     public:
         Cube(float size = 1.0f, const Color &color = Color::WHITE) : Mesh(8, 12, color)
         {
+            autoScale(size);
+
             if (!vertices || !faces)
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
@@ -60,6 +62,8 @@ namespace pip3D
     public:
         Pyramid(float size = 1.0f, const Color &color = Color::WHITE) : Mesh(5, 6, color)
         {
+            autoScale(size);
+
             if (!vertices || !faces)
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
@@ -102,6 +106,8 @@ namespace pip3D
                    2 * (segments ? segments : 3) * ((rings > 1 ? rings : 2) - 1),
                    color)
         {
+            autoScale(radius * 2.0f);
+
             if (!vertices || !faces)
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
@@ -174,6 +180,9 @@ namespace pip3D
                    (subdivisions ? subdivisions : 1) * (subdivisions ? subdivisions : 1) * 2,
                    color)
         {
+            const float size = (width > depth) ? width : depth;
+            autoScale(size);
+
             if (!vertices || !faces)
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
@@ -224,6 +233,9 @@ namespace pip3D
                    (segments ? segments : 3) * 4,
                    color)
         {
+            const float size = (height > radius * 2.0f) ? height : radius * 2.0f;
+            autoScale(size);
+
             if (!vertices || !faces)
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
@@ -277,6 +289,9 @@ namespace pip3D
                    (segments ? segments : 3) * 2,
                    color)
         {
+            const float size = (height > radius * 2.0f) ? height : radius * 2.0f;
+            autoScale(size);
+
             if (!vertices || !faces)
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
@@ -322,6 +337,9 @@ namespace pip3D
                    (segments ? segments : 3) * ((rings < 2 ? 2 : rings) + 1) * 2,
                    color)
         {
+            const float size = (height > radius * 2.0f) ? height : radius * 2.0f;
+            autoScale(size);
+
             if (!vertices || !faces)
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
@@ -404,6 +422,8 @@ namespace pip3D
         Teapot(float scale = 1.0f, const Color &color = Color::WHITE)
             : Mesh(512, 1024, color)
         {
+            autoScale(scale * 4.0f);
+
             if (!vertices || !faces)
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,
@@ -545,6 +565,8 @@ namespace pip3D
                    (segments ? segments : 3) * (tubeSegments ? tubeSegments : 3) * 2,
                    color)
         {
+            autoScale(scale * 6.0f);
+
             if (!vertices || !faces)
             {
                 LOGE(::pip3D::Debug::LOG_MODULE_RESOURCES,

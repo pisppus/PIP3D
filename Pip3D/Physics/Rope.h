@@ -337,7 +337,7 @@ namespace pip3D
             }
         }
 
-        void applyFriction(Node &n, const Vector3 &/*normal*/, float friction)
+        void applyFriction(Node &n, const Vector3 & /*normal*/, float friction)
         {
             if (friction <= 0.0f)
                 return;
@@ -550,4 +550,3 @@ namespace pip3D
 }
 
 #endif
-

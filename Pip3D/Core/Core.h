@@ -4,6 +4,7 @@
 #include "../Math/Math.h"
 #include <Arduino.h>
 #include <SPI.h>
+#include <esp_heap_caps.h>
 #include <cstdlib>
 #include <cstring>
 #include "Debug/Logging.h"
@@ -35,6 +36,29 @@ namespace pip3D
     Display(uint16_t w, uint16_t h, int8_t cs_, int8_t dc_, int8_t rst_)
         : width(w), height(h), cs(cs_), dc(dc_), rst(rst_) {}
   };
+
+  // Global screen configuration (physical display resolution)
+  static constexpr uint16_t SCREEN_WIDTH = 480;
+  static constexpr uint16_t SCREEN_HEIGHT = 320;
+
+  // Banded rendering configuration: number of horizontal bands and band height
+  static constexpr uint16_t SCREEN_BAND_COUNT = 2;
+  static constexpr uint16_t SCREEN_BAND_HEIGHT = SCREEN_HEIGHT / SCREEN_BAND_COUNT;
+
+  // Per-frame band state used by the renderer and rasterizer.
+  // currentBandOffsetY: top Y coordinate (in full-screen space) of the active band.
+  // currentBandHeight:  height of the active band in pixels.
+  __attribute__((always_inline)) inline int16_t &currentBandOffsetY()
+  {
+    static int16_t offsetY = 0;
+    return offsetY;
+  }
+
+  __attribute__((always_inline)) inline int16_t &currentBandHeight()
+  {
+    static int16_t h = SCREEN_HEIGHT;
+    return h;
+  }
 
   struct alignas(2) Color
   {
@@ -455,6 +479,36 @@ namespace pip3D
         free(ptr);
     }
 
+    static void *allocData(size_t size, size_t align = 16)
+    {
+      if (size == 0)
+      {
+        return nullptr;
+      }
+
+#ifdef PIP3D_USE_PSRAM
+      if (psramFound())
+      {
+        void *ptr = heap_caps_aligned_alloc(align, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (ptr)
+        {
+          return ptr;
+        }
+      }
+#endif
+
+      return heap_caps_aligned_alloc(align, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+
+    static void freeData(void *ptr)
+    {
+      if (!ptr)
+      {
+        return;
+      }
+      heap_caps_free(ptr);
+    }
+
     static bool isInPSRAM(void *ptr)
     {
       return ((uint32_t)ptr >= 0x3F800000 && (uint32_t)ptr < 0x3FC00000);
@@ -484,6 +538,7 @@ namespace pip3D
       static constexpr int MAX_TRIANGLES = 20000;
       static constexpr float Z_NEAR = 0.1f;
       static constexpr float Z_FAR = 1000.0f;
+      static constexpr uint16_t BAND_HEIGHT = 40;
     };
   };
 
