@@ -364,10 +364,7 @@ namespace pip3D
                                      const Matrix4x4 &viewProjMatrix,
                                      FrameBuffer &framebuffer,
                                      ZBuffer *zBuffer,
-                                     const Texture &tex,
-                                     const Mesh *meshForTelemetry,
-                                     uint16_t faceIdxForTelemetry,
-                                     uint32_t frameForTelemetry);
+                                     const Texture &tex);
 
         void drawTriangle3D(const Vector3 &v0, const Vector3 &v1, const Vector3 &v2, uint16_t color);
         void drawBlobShadow(const Vector3 &position, float radius, float opacity);

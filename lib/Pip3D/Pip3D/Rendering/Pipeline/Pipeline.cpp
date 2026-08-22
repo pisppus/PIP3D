@@ -14,6 +14,8 @@
 #include "Rendering/Pipeline/Rasterizer/Textured.hpp"
 #include "Rendering/Pipeline/Shading.hpp"
 #include "Rendering/Pipeline/Telemetry.hpp"
+#include "Rendering/Resources/Texture.hpp"
+#include "Rendering/Resources/Textures/Missing.hpp"
 #include "Rendering/Renderer.hpp"
 
 namespace pip3D
@@ -161,10 +163,7 @@ namespace pip3D
                                            const Matrix4x4 &viewProjMatrix,
                                            FrameBuffer &framebuffer,
                                            ZBuffer *zBuffer,
-                                           const Texture &tex,
-                                           const Mesh *meshForTelemetry,
-                                           uint16_t faceIdxForTelemetry,
-                                           uint32_t frameForTelemetry)
+                                           const Texture &tex)
     {
         DrawTelemetryClipVert clipped[4];
         int outCount = 0;
@@ -360,28 +359,6 @@ namespace pip3D
                 continue;
             }
 
-#if 0
-            if (chunk.coneDot > 0)
-            {
-                const Vector3 toCam = camPos - worldCenter;
-                const float dLenSq = toCam.lengthSquared();
-                if (dLenSq > 1e-4f)
-                {
-                    const float invDLen = FastMath::fastInvSqrt(dLenSq);
-                    const Vector3 viewDir = toCam * invDLen;
-
-                    const Vector3 localNorm(static_cast<float>(chunk.normX) * (1.0f / 32767.0f),
-                                            static_cast<float>(chunk.normY) * (1.0f / 32767.0f),
-                                            static_cast<float>(chunk.normZ) * (1.0f / 32767.0f));
-                    const Vector3 worldNorm = Culling::transformDirection(worldTransform, localNorm);
-
-                    const float sinHalf = static_cast<float>(chunk.coneDot) * (1.0f / 32767.0f);
-                    if (Culling::isChunkBackface(worldNorm, viewDir, sinHalf))
-                        continue;
-                }
-            }
-#endif
-
             const float chunkEyeZ = (worldCenter.x - camPos.x) * camFwd.x +
                                     (worldCenter.y - camPos.y) * camFwd.y +
                                     (worldCenter.z - camPos.z) * camFwd.z;
@@ -472,16 +449,22 @@ namespace pip3D
         if (zEye > cam.nearPlane && radiusPixels < 1.0f)
             return;
 
+        const ShadingMode effectiveMode = instance->getEffectiveShadingMode(shadingMode);
+
         const Vector3 center = instance->center();
         const float radius = instance->radius();
         const DisplayConfig &framebufferConfig = framebuffer.getConfig();
 
         const uint16_t instColor565 = instance->color().rgb565;
-        float baseR, baseG, baseB;
-        MeshRenderer::decodeColorToFloat(instColor565, baseR, baseG, baseB);
+        float instR, instG, instB;
+        MeshRenderer::decodeColorToFloat(instColor565, instR, instG, instB);
+
+        const uint32_t subMeshCount = mesh->numSubMeshes();
+        const bool hasSubMeshes = mesh->hasSubMeshes();
 
         const bool isEmissiveInst = instance->isEmissive();
-        const bool useUniformColor = mesh->getSingleColorLighting() || isEmissiveInst;
+
+        bool useUniformColor = (mesh->getSingleColorLighting() || isEmissiveInst) && effectiveMode == SHADING_FLAT;
         uint16_t uniformColor = 0;
 
         Light localLights[4];
@@ -505,7 +488,7 @@ namespace pip3D
 
                 float litR, litG, litB;
                 Shading::calculateLambert(worldNormal, localLights, localLightCount,
-                                          baseR, baseG, baseB,
+                                          instR, instG, instB,
                                           litR, litG, litB);
 
                 const float vx = cam.position.x - center.x;
@@ -520,12 +503,16 @@ namespace pip3D
             }
         }
 
+        NormalMatrix nmWorld(worldTransform);
+        const bool needsWorldNormals = (effectiveMode != SHADING_FLAT);
+
         const uint32_t vertexCountUsed = mesh->numVertices();
         const uint32_t faceCount = mesh->numFaces();
 
         DrawCache *const cache = &instance->drawCache();
 
         Vector3 *PIP3D_RESTRICT worldVerts = nullptr;
+        Vector3 *PIP3D_RESTRICT worldNormals = nullptr;
         Vector3 *PIP3D_RESTRICT screenVerts = nullptr;
 
         const uint32_t frameStamp = g_frameStamp;
@@ -544,7 +531,12 @@ namespace pip3D
         const bool isTextured = mesh->isTextured();
         const bool doBackfaceCull = backfaceCullingEnabled;
 
-        const Texture *const meshTexture = isTextured ? mesh->getTexture() : nullptr;
+        const Texture *meshTexture = isTextured ? mesh->getTexture() : nullptr;
+        if (!meshTexture && mesh->wantsTexture())
+        {
+            meshTexture = &g_missingTexture;
+        }
+        const bool effectiveTextured = (meshTexture != nullptr);
         const Vector3 &camFwd = cam.forward();
 
         const uint32_t chunkCount = mesh->numChunks();
@@ -554,9 +546,11 @@ namespace pip3D
         if (!hasChunks)
         {
             if (likely(cache->ensureCapacity(static_cast<uint16_t>(
-                    vertexCountUsed > 65535 ? 65535 : vertexCountUsed))))
+                                                 vertexCountUsed > 65535 ? 65535 : vertexCountUsed),
+                                             needsWorldNormals)))
             {
                 worldVerts = cache->worldVerts();
+                worldNormals = cache->worldNormals();
                 screenVerts = cache->screenVerts();
             }
 
@@ -573,16 +567,16 @@ namespace pip3D
                         worldVerts[i] = world;
                         screenVerts[i] = CameraController::project(world, viewProjMatrix,
                                                                    viewportHalfWidth, viewportHalfHeight, 0, 0);
+                        if (needsWorldNormals)
+                            worldNormals[i] = nmWorld.transform(vbase[i].normal.get());
                     }
                     cache->commitProjection(frameStamp, instanceVersion);
                 }
                 else if (projState == DrawCache::ProjState::NeedsReproject)
                 {
                     for (uint32_t i = 0; i < vertexCountUsed; ++i)
-                    {
                         screenVerts[i] = CameraController::project(worldVerts[i], viewProjMatrix,
                                                                    viewportHalfWidth, viewportHalfHeight, 0, 0);
-                    }
                     cache->commitProjection(frameStamp, instanceVersion);
                 }
             }
@@ -590,6 +584,8 @@ namespace pip3D
             const bool is32 = mesh->isIndex32();
             const Face16 *PIP3D_RESTRICT fbase16 = is32 ? nullptr : mesh->faceData16();
             const Face32 *PIP3D_RESTRICT fbase32 = is32 ? mesh->faceData32() : nullptr;
+
+            uint32_t currentSubMesh = 0;
 
             for (uint32_t i = 0; i < faceCount; ++i)
             {
@@ -643,7 +639,6 @@ namespace pip3D
                     const float vx = v0.x - camPos.x;
                     const float vy = v0.y - camPos.y;
                     const float vz = v0.z - camPos.z;
-
                     if (nx * vx + ny * vy + nz * vz >= 0.0f)
                     {
                         statsTrianglesBackfaceCulled++;
@@ -671,7 +666,6 @@ namespace pip3D
                     const float maxY = (p0.y > p1.y) ? ((p0.y > p2.y) ? p0.y : p2.y) : ((p1.y > p2.y) ? p1.y : p2.y);
                     if (maxY < bandTop || minY >= bandBottom)
                         continue;
-
                     const float minX = (p0.x < p1.x) ? ((p0.x < p2.x) ? p0.x : p2.x) : ((p1.x < p2.x) ? p1.x : p2.x);
                     const float maxX = (p0.x > p1.x) ? ((p0.x > p2.x) ? p0.x : p2.x) : ((p1.x > p2.x) ? p1.x : p2.x);
                     if (maxX < 0.0f || minX >= viewportWidth)
@@ -690,24 +684,56 @@ namespace pip3D
                     }
                 }
 
-                if (isTextured)
+                float faceR = instR, faceG = instG, faceB = instB;
+                if (hasSubMeshes)
+                {
+                    while (currentSubMesh < subMeshCount &&
+                           i >= mesh->subMeshFaceEnd(currentSubMesh))
+                        ++currentSubMesh;
+                    if (currentSubMesh < subMeshCount)
+                    {
+                        float sr, sg, sb;
+                        mesh->subMeshColor(currentSubMesh).toFloat(sr, sg, sb);
+                        faceR = instR * sr;
+                        faceG = instG * sg;
+                        faceB = instB * sb;
+                    }
+                }
+
+                if (effectiveTextured)
                 {
                     const Vertex &vert0 = vbase[vIdx0];
                     const Vertex &vert1 = vbase[vIdx1];
                     const Vertex &vert2 = vbase[vIdx2];
 
                     float lr0, lg0, lb0, lr1, lg1, lb1, lr2, lg2, lb2;
-                    Shading::calculateFaceLighting(
-                        v0, v1, v2, camPos,
-                        localLights, localLightCount,
-                        baseR, baseG, baseB,
-                        lr0, lg0, lb0);
-                    lr1 = lr0;
-                    lg1 = lg0;
-                    lb1 = lb0;
-                    lr2 = lr0;
-                    lg2 = lg0;
-                    lb2 = lb0;
+
+                    if (effectiveMode == SHADING_GOURAUD)
+                    {
+                        Vector3 n0 = worldNormals ? worldNormals[vIdx0] : vbase[vIdx0].normal.get();
+                        Vector3 n1 = worldNormals ? worldNormals[vIdx1] : vbase[vIdx1].normal.get();
+                        Vector3 n2 = worldNormals ? worldNormals[vIdx2] : vbase[vIdx2].normal.get();
+                        Shading::calculateVertexLightingGouraud(v0, n0, camPos,
+                                                                localLights, localLightCount, faceR, faceG, faceB, lr0, lg0, lb0);
+                        Shading::calculateVertexLightingGouraud(v1, n1, camPos,
+                                                                localLights, localLightCount, faceR, faceG, faceB, lr1, lg1, lb1);
+                        Shading::calculateVertexLightingGouraud(v2, n2, camPos,
+                                                                localLights, localLightCount, faceR, faceG, faceB, lr2, lg2, lb2);
+                    }
+                    else
+                    {
+                        Shading::calculateFaceLighting(
+                            v0, v1, v2, camPos,
+                            localLights, localLightCount,
+                            faceR, faceG, faceB,
+                            lr0, lg0, lb0);
+                        lr1 = lr0;
+                        lg1 = lg0;
+                        lb1 = lb0;
+                        lr2 = lr0;
+                        lg2 = lg0;
+                        lb2 = lb0;
+                    }
 
                     if (!partiallyClipped)
                     {
@@ -737,34 +763,106 @@ namespace pip3D
                             cv, nearClip,
                             cam, viewport, viewProjMatrix,
                             framebuffer, &zBuffer,
-                            *meshTexture,
-                            mesh, static_cast<uint16_t>(i), frameStamp);
+                            *meshTexture);
                     }
                     continue;
                 }
 
-                MeshRenderer::drawTriangle3D_Preprojected(
-                    v0, v1, v2, p0, p1, p2,
-                    d0, d1, d2,
-                    partiallyClipped,
-                    nearClip,
-                    camPos,
-                    instColor565,
-                    viewProjMatrix,
-                    viewport,
-                    viewportHalfWidth, viewportHalfHeight, viewportWidth,
-                    bandTop, bandBottom, bandTopF,
-                    framebuffer, &zBuffer,
-                    localLights, localLightCount,
-                    useUniformColor, uniformColor);
+                switch (effectiveMode)
+                {
+                case SHADING_FLAT:
+                    MeshRenderer::drawTriangle3D_Preprojected(
+                        v0, v1, v2, p0, p1, p2,
+                        d0, d1, d2,
+                        partiallyClipped,
+                        nearClip,
+                        camPos,
+                        Color::fromFloat(faceR, faceG, faceB).rgb565,
+                        viewProjMatrix,
+                        viewport,
+                        viewportHalfWidth, viewportHalfHeight, viewportWidth,
+                        bandTop, bandBottom, bandTopF,
+                        framebuffer, &zBuffer,
+                        localLights, localLightCount,
+                        useUniformColor, uniformColor);
+                    break;
+
+                case SHADING_GOURAUD:
+                {
+                    Vector3 n0 = worldNormals ? worldNormals[vIdx0] : vbase[vIdx0].normal.get();
+                    Vector3 n1 = worldNormals ? worldNormals[vIdx1] : vbase[vIdx1].normal.get();
+                    Vector3 n2 = worldNormals ? worldNormals[vIdx2] : vbase[vIdx2].normal.get();
+
+                    float lr0, lg0, lb0, lr1, lg1, lb1, lr2, lg2, lb2;
+                    Shading::calculateVertexLightingGouraud(v0, n0, camPos,
+                                                            localLights, localLightCount, faceR, faceG, faceB, lr0, lg0, lb0);
+                    Shading::calculateVertexLightingGouraud(v1, n1, camPos,
+                                                            localLights, localLightCount, faceR, faceG, faceB, lr1, lg1, lb1);
+                    Shading::calculateVertexLightingGouraud(v2, n2, camPos,
+                                                            localLights, localLightCount, faceR, faceG, faceB, lr2, lg2, lb2);
+
+                    if (likely(!partiallyClipped))
+                    {
+                        MeshRenderer::drawTriangle3D_Smooth_Preprojected(
+                            p0, p1, p2,
+                            lr0, lg0, lb0, lr1, lg1, lb1, lr2, lg2, lb2,
+                            viewportWidth, bandTop, bandBottom, bandTopF,
+                            framebuffer, &zBuffer);
+                    }
+                    else
+                    {
+                        const MeshRenderer::ClipVertSmooth cv[3] = {
+                            {v0, d0, lr0, lg0, lb0},
+                            {v1, d1, lr1, lg1, lb1},
+                            {v2, d2, lr2, lg2, lb2}};
+                        MeshRenderer::clipAndDrawNearSmooth(
+                            cv, nearClip, viewport, viewProjMatrix,
+                            framebuffer, &zBuffer);
+                    }
+                    break;
+                }
+
+                case SHADING_PHONG:
+                {
+                    Vector3 n0 = worldNormals ? worldNormals[vIdx0] : vbase[vIdx0].normal.get();
+                    Vector3 n1 = worldNormals ? worldNormals[vIdx1] : vbase[vIdx1].normal.get();
+                    Vector3 n2 = worldNormals ? worldNormals[vIdx2] : vbase[vIdx2].normal.get();
+
+                    if (likely(!partiallyClipped))
+                    {
+                        MeshRenderer::drawTriangle3D_Phong_Preprojected(
+                            v0, v1, v2, p0, p1, p2,
+                            n0, n1, n2, d0, d1, d2,
+                            faceR, faceG, faceB, camPos,
+                            viewportWidth, bandTop, bandBottom, bandTopF,
+                            framebuffer, &zBuffer,
+                            localLights, localLightCount);
+                    }
+                    else
+                    {
+                        const MeshRenderer::ClipVertPhong cv[3] = {
+                            {v0, n0, d0},
+                            {v1, n1, d1},
+                            {v2, n2, d2}};
+                        MeshRenderer::clipAndDrawNearPhong(
+                            cv, nearClip,
+                            faceR, faceG, faceB, camPos,
+                            viewport, viewProjMatrix,
+                            framebuffer, &zBuffer,
+                            localLights, localLightCount);
+                    }
+                    break;
+                }
+                }
             }
             return;
         }
 
         const uint16_t chunkCacheVerts = mesh->maxChunkVertexCount();
-        if (likely(cache->ensureCapacity(chunkCacheVerts)))
+        if (likely(cache->ensureCapacity(chunkCacheVerts, needsWorldNormals)))
         {
             worldVerts = cache->worldVerts();
+            worldNormals = cache->worldNormals();
             screenVerts = cache->screenVerts();
         }
 
@@ -789,6 +887,8 @@ namespace pip3D
         const uint8_t nb = static_cast<uint8_t>(
             (SCREEN_BAND_COUNT <= ChunkBandCache::MAX_BUCKETS) ? SCREEN_BAND_COUNT
                                                                : ChunkBandCache::MAX_BUCKETS);
+
+        uint32_t currentSubMesh = 0;
 
         for (uint8_t b = 0; b <= bandIndex && b < nb; ++b)
         {
@@ -823,8 +923,11 @@ namespace pip3D
                             worldVerts[i] = world;
                             screenVerts[i] = CameraController::project(world, viewProjMatrix,
                                                                        viewportHalfWidth, viewportHalfHeight, 0, 0);
+                            if (needsWorldNormals)
+                                worldNormals[i] = nmWorld.transform(chunkVBase[i].normal.get());
                         }
                         chunkCache.currentChunkIdx = rec.chunkIdx;
+                        currentSubMesh = 0;
                     }
                 }
 
@@ -882,7 +985,6 @@ namespace pip3D
                         const float vx = v0.x - camPos.x;
                         const float vy = v0.y - camPos.y;
                         const float vz = v0.z - camPos.z;
-
                         if (nx * vx + ny * vy + nz * vz >= 0.0f)
                         {
                             statsTrianglesBackfaceCulled++;
@@ -910,7 +1012,6 @@ namespace pip3D
                         const float maxY = (p0.y > p1.y) ? ((p0.y > p2.y) ? p0.y : p2.y) : ((p1.y > p2.y) ? p1.y : p2.y);
                         if (maxY < bandTop || minY >= bandBottom)
                             continue;
-
                         const float minX = (p0.x < p1.x) ? ((p0.x < p2.x) ? p0.x : p2.x) : ((p1.x < p2.x) ? p1.x : p2.x);
                         const float maxX = (p0.x > p1.x) ? ((p0.x > p2.x) ? p0.x : p2.x) : ((p1.x > p2.x) ? p1.x : p2.x);
                         if (maxX < 0.0f || minX >= viewportWidth)
@@ -929,7 +1030,23 @@ namespace pip3D
                         }
                     }
 
-                    if (isTextured)
+                    float faceR = instR, faceG = instG, faceB = instB;
+                    if (hasSubMeshes)
+                    {
+                        while (currentSubMesh < subMeshCount &&
+                               faceIdx >= mesh->subMeshFaceEnd(currentSubMesh))
+                            ++currentSubMesh;
+                        if (currentSubMesh < subMeshCount)
+                        {
+                            float sr, sg, sb;
+                            mesh->subMeshColor(currentSubMesh).toFloat(sr, sg, sb);
+                            faceR = instR * sr;
+                            faceG = instG * sg;
+                            faceB = instB * sb;
+                        }
+                    }
+
+                    if (effectiveTextured)
                     {
                         const Vertex *chunkVBase = vbase + chunkVOffset;
                         const Vertex &vert0 = chunkVBase[vIdx0];
@@ -937,17 +1054,31 @@ namespace pip3D
                         const Vertex &vert2 = chunkVBase[vIdx2];
 
                         float lr0, lg0, lb0, lr1, lg1, lb1, lr2, lg2, lb2;
-                        Shading::calculateFaceLighting(
-                            v0, v1, v2, camPos,
-                            localLights, localLightCount,
-                            baseR, baseG, baseB,
-                            lr0, lg0, lb0);
-                        lr1 = lr0;
-                        lg1 = lg0;
-                        lb1 = lb0;
-                        lr2 = lr0;
-                        lg2 = lg0;
-                        lb2 = lb0;
+
+                        if (effectiveMode == SHADING_GOURAUD)
+                        {
+                            Vector3 n0 = worldNormals ? worldNormals[vIdx0] : chunkVBase[vIdx0].normal.get();
+                            Vector3 n1 = worldNormals ? worldNormals[vIdx1] : chunkVBase[vIdx1].normal.get();
+                            Vector3 n2 = worldNormals ? worldNormals[vIdx2] : chunkVBase[vIdx2].normal.get();
+                            Shading::calculateVertexLightingGouraud(v0, n0, camPos,
+                                                                    localLights, localLightCount, faceR, faceG, faceB, lr0, lg0, lb0);
+                            Shading::calculateVertexLightingGouraud(v1, n1, camPos,
+                                                                    localLights, localLightCount, faceR, faceG, faceB, lr1, lg1, lb1);
+                            Shading::calculateVertexLightingGouraud(v2, n2, camPos,
+                                                                    localLights, localLightCount, faceR, faceG, faceB, lr2, lg2, lb2);
+                        }
+                        else
+                        {
+                            Shading::calculateFaceLighting(v0, v1, v2, camPos,
+                                                           localLights, localLightCount, faceR, faceG, faceB,
+                                                           lr0, lg0, lb0);
+                            lr1 = lr0;
+                            lg1 = lg0;
+                            lb1 = lb0;
+                            lr2 = lr0;
+                            lg2 = lg0;
+                            lb2 = lb0;
+                        }
 
                         if (!partiallyClipped)
                         {
@@ -959,13 +1090,9 @@ namespace pip3D
                                 vert1.tu, vert1.tv,
                                 vert2.tu, vert2.tv,
                                 d0, d1, d2,
-                                lr0, lg0, lb0,
-                                lr1, lg1, lb1,
-                                lr2, lg2, lb2,
+                                lr0, lg0, lb0, lr1, lg1, lb1, lr2, lg2, lb2,
                                 *meshTexture,
-                                framebuffer.getBuffer(),
-                                &zBuffer,
-                                framebufferConfig);
+                                framebuffer.getBuffer(), &zBuffer, framebufferConfig);
                         }
                         else
                         {
@@ -974,29 +1101,96 @@ namespace pip3D
                                 {v1, vert1.tu, vert1.tv, d1, lr1, lg1, lb1},
                                 {v2, vert2.tu, vert2.tv, d2, lr2, lg2, lb2}};
                             clipAndDrawNearTextured(
-                                cv, nearClip,
-                                cam, viewport, viewProjMatrix,
-                                framebuffer, &zBuffer,
-                                *meshTexture,
-                                mesh, static_cast<uint16_t>(faceIdx), frameStamp);
+                                cv, nearClip, cam, viewport, viewProjMatrix,
+                                framebuffer, &zBuffer, *meshTexture);
                         }
                         continue;
                     }
 
-                    MeshRenderer::drawTriangle3D_Preprojected(
-                        v0, v1, v2, p0, p1, p2,
-                        d0, d1, d2,
-                        partiallyClipped,
-                        nearClip,
-                        camPos,
-                        instColor565,
-                        viewProjMatrix,
-                        viewport,
-                        viewportHalfWidth, viewportHalfHeight, viewportWidth,
-                        bandTop, bandBottom, bandTopF,
-                        framebuffer, &zBuffer,
-                        localLights, localLightCount,
-                        useUniformColor, uniformColor);
+                    switch (effectiveMode)
+                    {
+                    case SHADING_FLAT:
+                        MeshRenderer::drawTriangle3D_Preprojected(
+                            v0, v1, v2, p0, p1, p2,
+                            d0, d1, d2,
+                            partiallyClipped, nearClip, camPos,
+                            Color::fromFloat(faceR, faceG, faceB).rgb565,
+                            viewProjMatrix, viewport,
+                            viewportHalfWidth, viewportHalfHeight, viewportWidth,
+                            bandTop, bandBottom, bandTopF,
+                            framebuffer, &zBuffer,
+                            localLights, localLightCount,
+                            useUniformColor, uniformColor);
+                        break;
+
+                    case SHADING_GOURAUD:
+                    {
+                        const Vertex *chunkVBase = vbase + chunkVOffset;
+                        Vector3 n0 = worldNormals ? worldNormals[vIdx0] : chunkVBase[vIdx0].normal.get();
+                        Vector3 n1 = worldNormals ? worldNormals[vIdx1] : chunkVBase[vIdx1].normal.get();
+                        Vector3 n2 = worldNormals ? worldNormals[vIdx2] : chunkVBase[vIdx2].normal.get();
+
+                        float lr0, lg0, lb0, lr1, lg1, lb1, lr2, lg2, lb2;
+                        Shading::calculateVertexLightingGouraud(v0, n0, camPos,
+                                                                localLights, localLightCount, faceR, faceG, faceB, lr0, lg0, lb0);
+                        Shading::calculateVertexLightingGouraud(v1, n1, camPos,
+                                                                localLights, localLightCount, faceR, faceG, faceB, lr1, lg1, lb1);
+                        Shading::calculateVertexLightingGouraud(v2, n2, camPos,
+                                                                localLights, localLightCount, faceR, faceG, faceB, lr2, lg2, lb2);
+
+                        if (likely(!partiallyClipped))
+                        {
+                            MeshRenderer::drawTriangle3D_Smooth_Preprojected(
+                                p0, p1, p2,
+                                lr0, lg0, lb0, lr1, lg1, lb1, lr2, lg2, lb2,
+                                viewportWidth, bandTop, bandBottom, bandTopF,
+                                framebuffer, &zBuffer);
+                        }
+                        else
+                        {
+                            const MeshRenderer::ClipVertSmooth cv[3] = {
+                                {v0, d0, lr0, lg0, lb0},
+                                {v1, d1, lr1, lg1, lb1},
+                                {v2, d2, lr2, lg2, lb2}};
+                            MeshRenderer::clipAndDrawNearSmooth(
+                                cv, nearClip, viewport, viewProjMatrix,
+                                framebuffer, &zBuffer);
+                        }
+                        break;
+                    }
+
+                    case SHADING_PHONG:
+                    {
+                        const Vertex *chunkVBase = vbase + chunkVOffset;
+                        Vector3 n0 = worldNormals ? worldNormals[vIdx0] : chunkVBase[vIdx0].normal.get();
+                        Vector3 n1 = worldNormals ? worldNormals[vIdx1] : chunkVBase[vIdx1].normal.get();
+                        Vector3 n2 = worldNormals ? worldNormals[vIdx2] : chunkVBase[vIdx2].normal.get();
+
+                        if (likely(!partiallyClipped))
+                        {
+                            MeshRenderer::drawTriangle3D_Phong_Preprojected(
+                                v0, v1, v2, p0, p1, p2,
+                                n0, n1, n2, d0, d1, d2,
+                                faceR, faceG, faceB, camPos,
+                                viewportWidth, bandTop, bandBottom, bandTopF,
+                                framebuffer, &zBuffer,
+                                localLights, localLightCount);
+                        }
+                        else
+                        {
+                            const MeshRenderer::ClipVertPhong cv[3] = {
+                                {v0, n0, d0},
+                                {v1, n1, d1},
+                                {v2, n2, d2}};
+                            MeshRenderer::clipAndDrawNearPhong(
+                                cv, nearClip, faceR, faceG, faceB, camPos,
+                                viewport, viewProjMatrix,
+                                framebuffer, &zBuffer,
+                                localLights, localLightCount);
+                        }
+                        break;
+                    }
+                    }
                 }
             }
         }

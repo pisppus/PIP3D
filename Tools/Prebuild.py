@@ -4,23 +4,10 @@ sys.dont_write_bytecode = True
 import os
 import json
 import hashlib
+import importlib
 import subprocess
 
 Import("env")
-
-try:
-    from PIL import Image
-except ImportError:
-    print("\033[36m[Pip3D]\033[0m Pillow not found, installing...")
-    subprocess.check_call([env.subst("$PYTHONEXE"), "-m", "pip", "install", "Pillow"])
-
-try:
-    import miniaudio
-    import numpy
-    import matplotlib
-except ImportError:
-    print("\033[36m[Pip3D]\033[0m Audio tools (miniaudio/numpy/matplotlib) not found, installing...")
-    subprocess.check_call([env.subst("$PYTHONEXE"), "-m", "pip", "install", "miniaudio", "numpy", "matplotlib"])
 
 project_dir = env.subst("$PROJECT_DIR")
 
@@ -28,19 +15,54 @@ ANSI_GREEN  = "\033[32m"
 ANSI_YELLOW = "\033[33m"
 ANSI_RESET  = "\033[0m"
 
-CACHE_VERSION = 2
-CACHE_PATH    = os.path.join(project_dir, ".pio", "prebuild_cache.json")
+CACHE_VERSION = 3
+CACHE_PATH    = os.path.join(project_dir, ".pio", "pip3d_assetdb.json")
 
 CHUNK_SUFFIX            = "_chunk"
 BUILTIN_ENGINE_MODELS   = {"suzanne", "teapot"}
-BUILTIN_ENGINE_TEXTURES = {"barrier", "concrete", "gravel", "sun", "tile"}
+BUILTIN_ENGINE_TEXTURES = {"barrier", "concrete", "gravel", "sun", "tile", "missing"}
+
+GEN_DEPS = {
+    "models":   [],
+    "textures": ["PIL"],
+    "sun":      ["PIL", "numpy"],
+    "sky":      ["numpy", "PIL"],
+    "missing":  [],
+    "audio":    ["numpy", "miniaudio"],
+}
 
 
 def _tag(color, msg):
     return f"{color}[Pip3D]{ANSI_RESET} {msg}"
 
 
+def ensure_pip_packages(modules):
+    missing = []
+    for mod in modules:
+        try:
+            importlib.import_module(mod)
+        except ImportError:
+            missing.append("Pillow" if mod == "PIL" else mod)
+    if not missing:
+        return
+    print(_tag(ANSI_YELLOW, f"Installing Python dependencies: {', '.join(missing)}"))
+    subprocess.check_call([env.subst("$PYTHONEXE"), "-m", "pip", "install"] + missing)
+    for mod in missing:
+        importlib.import_module(mod)
+
+
+FILES_DB = {}
+
+
 def file_hash(path, chunk=1 << 16):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = os.path.normcase(os.path.abspath(path))
+    rec = FILES_DB.get(key)
+    if rec and rec[0] == st.st_mtime_ns and rec[1] == st.st_size:
+        return rec[2]
     h = hashlib.sha256()
     try:
         with open(path, "rb") as f:
@@ -51,7 +73,9 @@ def file_hash(path, chunk=1 << 16):
                 h.update(buf)
     except OSError:
         return None
-    return h.hexdigest()
+    digest = h.hexdigest()
+    FILES_DB[key] = (st.st_mtime_ns, st.st_size, digest)
+    return digest
 
 
 def load_cache():
@@ -59,16 +83,21 @@ def load_cache():
         with open(CACHE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if data.get("version") != CACHE_VERSION:
-            return {}
-        return data.get("entries", {})
+            return {}, {}
+        files = {k: tuple(v) for k, v in data.get("files", {}).items()}
+        return data.get("entries", {}), files
     except (OSError, ValueError):
-        return {}
+        return {}, {}
 
 
 def save_cache(entries):
     os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
-    payload = {"version": CACHE_VERSION, "entries": entries}
-    tmp     = CACHE_PATH + ".tmp"
+    payload = {
+        "version": CACHE_VERSION,
+        "files": {k: list(v) for k, v in FILES_DB.items() if os.path.exists(k)},
+        "entries": entries,
+    }
+    tmp = CACHE_PATH + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -77,24 +106,50 @@ def save_cache(entries):
         pass
 
 
-def needs_rebuild(entries, key, source_path, output_path):
-    src_hash = file_hash(source_path)
-    if src_hash is None or not os.path.exists(output_path):
+def make_fingerprint(script_paths, source_paths=(), extra=""):
+    h = hashlib.sha256()
+    for p in list(script_paths) + list(source_paths):
+        h.update((file_hash(p) or "-").encode("utf-8"))
+        h.update(b"\x00")
+    h.update(extra.encode("utf-8"))
+    return h.hexdigest()
+
+
+def obj_material_deps(obj_path):
+    deps = []
+    stem = os.path.splitext(obj_path)[0]
+    same_stem = stem + ".mtl"
+    if os.path.isfile(same_stem):
+        deps.append(same_stem)
+    else:
+        try:
+            with open(obj_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if parts and parts[0] == "mtllib":
+                        cand = os.path.join(os.path.dirname(obj_path), " ".join(parts[1:]))
+                        if os.path.isfile(cand):
+                            deps.append(cand)
+                        break
+        except OSError:
+            pass
+    return deps
+
+
+def needs_rebuild(entries, key, fingerprint, output_path):
+    if not os.path.exists(output_path):
         return True
     rec = entries.get(key)
-    if not rec:
+    if not rec or rec.get("fingerprint") != fingerprint:
         return True
     out_hash = file_hash(output_path)
-    if out_hash is None or rec.get("output_hash") != out_hash:
-        return True
-    return rec.get("source_hash") != src_hash
+    return out_hash is None or rec.get("output_hash") != out_hash
 
 
-def mark_built(entries, key, source_path, output_path):
+def mark_built(entries, key, fingerprint, output_path):
     entries[key] = {
-        "source_hash": file_hash(source_path) or "",
+        "fingerprint": fingerprint,
         "output_hash": file_hash(output_path) or "",
-        "source_file": os.path.basename(source_path),
     }
 
 
@@ -150,11 +205,27 @@ def parse_screen_resolution():
     return width, height
 
 
-CACHE         = load_cache()
+CACHE, _FILES_LOADED = load_cache()
+FILES_DB.update(_FILES_LOADED)
 CACHE_CHANGED = False
+LIVE_KEYS     = set()
+
+
+def asset_is_current(key, fingerprint, output_path):
+    LIVE_KEYS.add(key)
+    return not needs_rebuild(CACHE, key, fingerprint, output_path)
+
+
+def asset_mark_built(key, fingerprint, output_path):
+    global CACHE_CHANGED
+    mark_built(CACHE, key, fingerprint, output_path)
+    touch(output_path)
+    CACHE_CHANGED = True
+
 
 models_dir        = os.path.join(project_dir, "Tools", "Models")
 obj_sources_dir   = os.path.join(models_dir, "Sources")
+models_convert_py = os.path.join(models_dir, "Convert.py")
 
 engine_models_dir = os.path.join(project_dir, "lib", "Pip3D", "Pip3D", "Geometry", "Models")
 app_models_dir    = os.path.join(project_dir, "src", "Models")
@@ -164,6 +235,7 @@ os.makedirs(app_models_dir, exist_ok=True)
 
 expected_engine_models = {}
 expected_app_models    = {}
+pending_models         = []
 
 if os.path.isdir(obj_sources_dir):
     for file in os.listdir(obj_sources_dir):
@@ -181,13 +253,19 @@ if os.path.isdir(obj_sources_dir):
                 expected_app_models[os.path.basename(hpp_path)] = True
 
             key = "model:" + file
-            if needs_rebuild(CACHE, key, obj_path, hpp_path):
+            fingerprint = make_fingerprint([models_convert_py], [obj_path] + obj_material_deps(obj_path), "obj2mesh")
+            if not asset_is_current(key, fingerprint, hpp_path):
                 dest_label = "Engine (Geometry/Models)" if is_engine else "App (src/Models)"
                 print(_tag(ANSI_GREEN, f"Building model: {file} -> {dest_label}/{clean_name}.hpp"))
-                run_convert(os.path.join(models_dir, "Convert.py"), [obj_path, hpp_path])
-                mark_built(CACHE, key, obj_path, hpp_path)
-                touch(hpp_path)
-                CACHE_CHANGED = True
+                pending_models.append((obj_path, hpp_path, key, fingerprint))
+
+if pending_models:
+    batch_args = []
+    for obj_path, hpp_path, _, _ in pending_models:
+        batch_args += [obj_path, hpp_path]
+    run_convert(models_convert_py, batch_args)
+    for _, hpp_path, key, fingerprint in pending_models:
+        asset_mark_built(key, fingerprint, hpp_path)
 
 if os.path.isdir(engine_models_dir):
     for existing in os.listdir(engine_models_dir):
@@ -212,8 +290,9 @@ if os.path.isdir(app_models_dir):
                 pass
 
 
-textures_dir          = os.path.join(project_dir, "Tools", "Textures")
-tex_sources_dir       = os.path.join(textures_dir, "Sources")
+textures_dir       = os.path.join(project_dir, "Tools", "Textures")
+tex_sources_dir    = os.path.join(textures_dir, "Sources")
+textures_convert_py = os.path.join(textures_dir, "Convert.py")
 
 engine_textures_dir   = os.path.join(project_dir, "lib", "Pip3D", "Pip3D", "Rendering", "Resources", "Textures")
 app_textures_dir      = os.path.join(project_dir, "src", "Textures")
@@ -223,6 +302,7 @@ os.makedirs(app_textures_dir, exist_ok=True)
 
 expected_engine_textures = {}
 expected_app_textures    = {}
+pending_textures         = []
 
 if os.path.isdir(tex_sources_dir):
     claims = {}
@@ -251,25 +331,43 @@ if os.path.isdir(tex_sources_dir):
             img_path = os.path.join(tex_sources_dir, sources[0])
 
         key = "tex:" + clean_name
-        if needs_rebuild(CACHE, key, img_path, hpp_path):
+        fingerprint = make_fingerprint([textures_convert_py], [img_path], "png2tex")
+        if not asset_is_current(key, fingerprint, hpp_path):
             dest_label = "Engine (Resources/Textures)" if is_engine else "App (src/Textures)"
             print(_tag(ANSI_GREEN, f"Building texture: {sources[-1]} -> {dest_label}/{clean_name}.hpp"))
-            run_convert(os.path.join(textures_dir, "Convert.py"), [img_path, hpp_path])
-            mark_built(CACHE, key, img_path, hpp_path)
-            touch(hpp_path)
-            CACHE_CHANGED = True
+            pending_textures.append((img_path, hpp_path, key, fingerprint))
+
+if pending_textures:
+    ensure_pip_packages(GEN_DEPS["textures"])
+    batch_args = []
+    for img_path, hpp_path, _, _ in pending_textures:
+        batch_args += [img_path, hpp_path]
+    run_convert(textures_convert_py, batch_args)
+    for _, hpp_path, key, fingerprint in pending_textures:
+        asset_mark_built(key, fingerprint, hpp_path)
 
 sun_hpp_path = os.path.join(engine_textures_dir, "Sun.hpp")
-sungen_path  = os.path.join(textures_dir, "Sungen.py")
+sungen_path = os.path.join(textures_dir, "Sungen.py")
 if os.path.isfile(sungen_path):
     expected_engine_textures["Sun.hpp"] = True
     sun_key = "sungen:sun"
-    if needs_rebuild(CACHE, sun_key, sungen_path, sun_hpp_path):
+    sun_fingerprint = make_fingerprint([sungen_path])
+    if not asset_is_current(sun_key, sun_fingerprint, sun_hpp_path):
         print(_tag(ANSI_GREEN, f"Building sun texture: Sungen.py -> Sun.hpp"))
+        ensure_pip_packages(GEN_DEPS["sun"])
         run_convert(sungen_path, [sun_hpp_path])
-        mark_built(CACHE, sun_key, sungen_path, sun_hpp_path)
-        touch(sun_hpp_path)
-        CACHE_CHANGED = True
+        asset_mark_built(sun_key, sun_fingerprint, sun_hpp_path)
+
+missing_hpp_path = os.path.join(engine_textures_dir, "Missing.hpp")
+missinggen_path  = os.path.join(textures_dir, "Missinggen.py")
+if os.path.isfile(missinggen_path):
+    expected_engine_textures["Missing.hpp"] = True
+    missing_key = "missinggen:missing"
+    missing_fingerprint = make_fingerprint([missinggen_path])
+    if not asset_is_current(missing_key, missing_fingerprint, missing_hpp_path):
+        print(_tag(ANSI_GREEN, f"Building fallback texture: Missinggen.py -> Missing.hpp"))
+        run_convert(missinggen_path, [missing_hpp_path])
+        asset_mark_built(missing_key, missing_fingerprint, missing_hpp_path)
 
 if os.path.isdir(engine_textures_dir):
     for existing in os.listdir(engine_textures_dir):
@@ -300,20 +398,22 @@ clouds_hpp_path = os.path.join(project_dir, "lib", "Pip3D", "Pip3D", "Rendering"
 if os.path.isfile(skygen_path):
     screen_w, screen_h = parse_screen_resolution()
     sky_key = f"skygen:cloudsdata:{screen_w}x{screen_h}"
-    if needs_rebuild(CACHE, sky_key, skygen_path, clouds_hpp_path):
+    sky_fingerprint = make_fingerprint([skygen_path], extra=f"{screen_w}x{screen_h}")
+    if not asset_is_current(sky_key, sky_fingerprint, clouds_hpp_path):
         print(_tag(ANSI_GREEN, f"Building cloud data: Skygen.py -> CloudsData.hpp ({screen_w}x{screen_h})"))
+        ensure_pip_packages(GEN_DEPS["sky"])
         run_convert(skygen_path, [clouds_hpp_path, "--screen-w", str(screen_w), "--screen-h", str(screen_h)])
-        mark_built(CACHE, sky_key, skygen_path, clouds_hpp_path)
-        touch(clouds_hpp_path)
-        CACHE_CHANGED = True
+        asset_mark_built(sky_key, sky_fingerprint, clouds_hpp_path)
 
 
 audio_dir          = os.path.join(project_dir, "Tools", "Audio")
 audio_sources_dir  = os.path.join(audio_dir, "Sources")
+audio_convert_py   = os.path.join(audio_dir, "Convert.py")
 sounds_output_dir  = os.path.join(project_dir, "lib", "Pip3D", "Pip3D", "Audio", "Sounds")
 
 os.makedirs(sounds_output_dir, exist_ok=True)
 expected_audio_outputs = {}
+pending_audio          = []
 
 if os.path.isdir(audio_sources_dir):
     audio_claims = {}
@@ -336,12 +436,19 @@ if os.path.isdir(audio_sources_dir):
             src_path = os.path.join(audio_sources_dir, sources[0])
 
         key = "audio:" + clean_name
-        if needs_rebuild(CACHE, key, src_path, hpp_path):
+        fingerprint = make_fingerprint([audio_convert_py], [src_path], "audio")
+        if not asset_is_current(key, fingerprint, hpp_path):
             print(_tag(ANSI_GREEN, f"Building audio: {sources[-1]} -> {clean_name}.hpp"))
-            run_convert(os.path.join(audio_dir, "Convert.py"), [src_path, hpp_path])
-            mark_built(CACHE, key, src_path, hpp_path)
-            touch(hpp_path)
-            CACHE_CHANGED = True
+            pending_audio.append((src_path, hpp_path, key, fingerprint))
+
+if pending_audio:
+    ensure_pip_packages(GEN_DEPS["audio"])
+    batch_args = []
+    for src_path, hpp_path, _, _ in pending_audio:
+        batch_args += [src_path, hpp_path]
+    run_convert(audio_convert_py, batch_args)
+    for _, hpp_path, key, fingerprint in pending_audio:
+        asset_mark_built(key, fingerprint, hpp_path)
 
 if os.path.isdir(sounds_output_dir):
     for existing in os.listdir(sounds_output_dir):
@@ -353,5 +460,9 @@ if os.path.isdir(sounds_output_dir):
             except OSError:
                 pass
 
-if CACHE_CHANGED:
+stale_keys = [k for k in CACHE if k not in LIVE_KEYS]
+for k in stale_keys:
+    del CACHE[k]
+
+if CACHE_CHANGED or stale_keys:
     save_cache(CACHE)

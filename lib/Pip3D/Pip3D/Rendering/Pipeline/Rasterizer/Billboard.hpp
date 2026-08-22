@@ -119,8 +119,8 @@ namespace pip3D
             const float z2_scaled = z2;
             const int32_t z_step = static_cast<int32_t>(dz_dx_scaled * 16384.0f);
 
-            const float texW = tex.dimFlt();
-            const float texH = tex.dimFlt();
+            const float texW = tex.widthFlt();
+            const float texH = tex.heightFlt();
             const float tu0 = u0 * texW, tu1 = u1 * texW, tu2 = u2 * texW;
             const float tv0 = v0 * texH, tv1 = v1 * texH, tv2 = v2 * texH;
 
@@ -168,9 +168,9 @@ namespace pip3D
             }
 
             const uint16_t *const __restrict__ texData = tex.data;
-            const uint32_t texShiftU = tex.shift;
-            const uint32_t texMaskU = tex.mask();
-            const uint32_t texMaskV = tex.mask();
+            const uint32_t texShiftU = tex.shiftU;
+            const uint32_t texMaskU = tex.maskU();
+            const uint32_t texMaskV = tex.maskV();
 
             const bool doBlend = (blendMode == BB_BLEND_ALPHA) && (alphaByte > 0) && (alphaByte < 255);
             const uint32_t alpha5 = doBlend ? static_cast<uint32_t>(alphaByte >> 3) : 0u;

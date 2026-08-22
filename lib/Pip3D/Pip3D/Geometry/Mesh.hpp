@@ -3,6 +3,7 @@
 #include "Math/Algebra.hpp"
 #include "Math/Quant.hpp"
 #include "Core/Memory.hpp"
+#include "Core/Color.hpp"
 
 namespace pip3D
 {
@@ -52,6 +53,24 @@ namespace pip3D
     };
     static_assert(sizeof(MeshChunk) == 32, "MeshChunk layout changed — sync with Convert.py!");
 
+    struct SubMesh
+    {
+        uint16_t faceOffset;
+        uint16_t faceCount;
+        Color color;
+    };
+    static_assert(sizeof(SubMesh) == 6, "SubMesh layout changed — sync with Convert.py!");
+    static_assert(alignof(SubMesh) == 2, "SubMesh alignment drift");
+
+    struct SubMesh32
+    {
+        uint32_t faceOffset;
+        uint32_t faceCount;
+        Color color;
+    };
+    static_assert(sizeof(SubMesh32) == 12, "SubMesh32 layout changed — sync with Convert.py!");
+    static_assert(alignof(SubMesh32) == 4, "SubMesh32 alignment drift");
+
     class Mesh
     {
     private:
@@ -61,13 +80,30 @@ namespace pip3D
             kFlagSingleColorLighting = 1u << 1,
             kFlagStaticStorage = 1u << 2,
             kFlagBoundsValid = 1u << 3,
-            kFlagIndex32 = 1u << 4
+            kFlagIndex32 = 1u << 4,
+            kFlagHasSubMeshes = 1u << 5,
+            kFlagWantsTexture = 1u << 6,
+            kFlagSubMesh32 = 1u << 7,
         };
 
         static constexpr float kQScaleFactor = 0.5f * (1.0f / 32767.0f);
 
         PIP3D_COLD void calculateBoundingSphere() const;
         PIP3D_COLD void recomputeHalfExtentsFromVertices() const;
+
+        PIP3D_FORCE_INLINE void initSubMeshes(const SubMesh *sub, uint32_t count) noexcept
+        {
+            subMeshes_ = sub;
+            if (count > 0)
+                flags_ |= kFlagHasSubMeshes;
+        }
+
+        PIP3D_FORCE_INLINE void initSubMeshes(const SubMesh32 *sub, uint32_t count) noexcept
+        {
+            subMeshes32_ = sub;
+            if (count > 0)
+                flags_ |= kFlagHasSubMeshes | kFlagSubMesh32;
+        }
 
         PIP3D_COLD void cleanup()
         {
@@ -76,6 +112,7 @@ namespace pip3D
             vertices_ = nullptr;
             faces_ = nullptr;
             chunks_ = nullptr;
+            subMeshes_ = nullptr;
         }
 
     protected:
@@ -88,7 +125,13 @@ namespace pip3D
             void *facesRaw_;
         };
         const MeshChunk *chunks_;
+        union
+        {
+            const SubMesh *subMeshes_;
+            const SubMesh32 *subMeshes32_;
+        };
         uint32_t chunkCount_;
+        uint32_t subMeshCount_;
         float qScale_;
         uint32_t vertexCount_;
         uint32_t faceCount_;
@@ -105,7 +148,8 @@ namespace pip3D
 
     public:
         explicit Mesh(uint32_t maxVerts, uint32_t maxFaces)
-            : vertices_(nullptr), faces_(nullptr), chunks_(nullptr), chunkCount_(0),
+            : vertices_(nullptr), faces_(nullptr), chunks_(nullptr),
+              subMeshes_(nullptr), chunkCount_(0), subMeshCount_(0),
               qScale_(1.0f),
               vertexCount_(0), faceCount_(0),
               flags_(kFlagCastShadows),
@@ -123,17 +167,22 @@ namespace pip3D
             faces_ = (buf != nullptr) ? reinterpret_cast<Face16 *>(buf + maxVerts) : nullptr;
         }
 
+        template <typename SubMeshT = SubMesh>
         Mesh(const Vertex *extVerts, uint32_t vertCount,
              const Face16 *extFaces, uint32_t faceCountIn,
              bool staticStorage = true,
-             const MeshChunk *extChunks = nullptr, uint32_t chunkCountIn = 0)
+             const MeshChunk *extChunks = nullptr, uint32_t chunkCountIn = 0,
+             const SubMeshT *extSubMeshes = nullptr, uint32_t subMeshCountIn = 0)
             : vertices_(const_cast<Vertex *>(extVerts)),
               faces_(const_cast<Face16 *>(extFaces)),
               chunks_(extChunks),
+              subMeshes_(nullptr),
               chunkCount_(chunkCountIn),
+              subMeshCount_(subMeshCountIn),
               qScale_(1.0f),
               vertexCount_(vertCount), faceCount_(faceCountIn),
-              flags_(static_cast<uint8_t>(kFlagCastShadows | (staticStorage ? static_cast<uint8_t>(kFlagStaticStorage) : 0u))),
+              flags_(static_cast<uint8_t>(kFlagCastShadows |
+                                          (staticStorage ? static_cast<uint8_t>(kFlagStaticStorage) : 0u))),
               boundsCenter_(0.0f, 0.0f, 0.0f),
               boundsRadius_(0.0f),
               boundsHalfExtents_(0.0f, 0.0f, 0.0f),
@@ -141,19 +190,25 @@ namespace pip3D
               maxVertices_(vertCount), maxFaces_(faceCountIn),
               deleter_(&defaultDeleter)
         {
+            initSubMeshes(extSubMeshes, subMeshCountIn);
         }
 
+        template <typename SubMeshT = SubMesh>
         Mesh(const Vertex *extVerts, uint32_t vertCount,
              const Face32 *extFaces, uint32_t faceCountIn,
              bool staticStorage = true,
-             const MeshChunk *extChunks = nullptr, uint32_t chunkCountIn = 0)
+             const MeshChunk *extChunks = nullptr, uint32_t chunkCountIn = 0,
+             const SubMeshT *extSubMeshes = nullptr, uint32_t subMeshCountIn = 0)
             : vertices_(const_cast<Vertex *>(extVerts)),
               faces32_(const_cast<Face32 *>(extFaces)),
               chunks_(extChunks),
+              subMeshes_(nullptr),
               chunkCount_(chunkCountIn),
+              subMeshCount_(subMeshCountIn),
               qScale_(1.0f),
               vertexCount_(vertCount), faceCount_(faceCountIn),
-              flags_(static_cast<uint8_t>(kFlagCastShadows | kFlagIndex32 | (staticStorage ? static_cast<uint8_t>(kFlagStaticStorage) : 0u))),
+              flags_(static_cast<uint8_t>(kFlagCastShadows | kFlagIndex32 |
+                                          (staticStorage ? static_cast<uint8_t>(kFlagStaticStorage) : 0u))),
               boundsCenter_(0.0f, 0.0f, 0.0f),
               boundsRadius_(0.0f),
               boundsHalfExtents_(0.0f, 0.0f, 0.0f),
@@ -161,6 +216,7 @@ namespace pip3D
               maxVertices_(vertCount), maxFaces_(faceCountIn),
               deleter_(&defaultDeleter)
         {
+            initSubMeshes(extSubMeshes, subMeshCountIn);
         }
 
         Mesh(const Mesh &) = delete;
@@ -199,6 +255,7 @@ namespace pip3D
         [[nodiscard]] PIP3D_FORCE_INLINE uint32_t numFaces() const noexcept { return faceCount_; }
         [[nodiscard]] PIP3D_FORCE_INLINE uint32_t numVertices() const noexcept { return vertexCount_; }
         [[nodiscard]] PIP3D_FORCE_INLINE uint32_t numChunks() const noexcept { return chunkCount_; }
+        [[nodiscard]] PIP3D_FORCE_INLINE uint32_t numSubMeshes() const noexcept { return subMeshCount_; }
 
         [[nodiscard]] PIP3D_FORCE_INLINE bool isIndex32() const noexcept { return (flags_ & kFlagIndex32) != 0; }
         [[nodiscard]] PIP3D_FORCE_INLINE const Vertex *vertexData() const noexcept { return vertices_; }
@@ -207,6 +264,27 @@ namespace pip3D
         [[nodiscard]] PIP3D_FORCE_INLINE const Face16 *faceData() const noexcept { return faces_; }
         [[nodiscard]] PIP3D_FORCE_INLINE const MeshChunk *chunkData() const noexcept { return chunks_; }
         [[nodiscard]] PIP3D_FORCE_INLINE const MeshChunk &getChunk(uint32_t i) const noexcept { return chunks_[i]; }
+        [[nodiscard]] PIP3D_FORCE_INLINE bool hasSubMeshes() const noexcept { return (flags_ & kFlagHasSubMeshes) != 0 && subMeshCount_ > 0; }
+
+        [[nodiscard]] PIP3D_FORCE_INLINE uint32_t subMeshFaceEnd(uint32_t i) const noexcept
+        {
+            if (flags_ & kFlagSubMesh32)
+                return subMeshes32_[i].faceOffset + subMeshes32_[i].faceCount;
+            return static_cast<uint32_t>(subMeshes_[i].faceOffset) +
+                   static_cast<uint32_t>(subMeshes_[i].faceCount);
+        }
+        [[nodiscard]] PIP3D_FORCE_INLINE Color subMeshColor(uint32_t i) const noexcept
+        {
+            return (flags_ & kFlagSubMesh32) ? subMeshes32_[i].color : subMeshes_[i].color;
+        }
+        [[nodiscard]] PIP3D_FORCE_INLINE bool wantsTexture() const noexcept { return (flags_ & kFlagWantsTexture) != 0; }
+        PIP3D_FORCE_INLINE void setWantsTexture(bool e) noexcept
+        {
+            if (e)
+                flags_ |= kFlagWantsTexture;
+            else
+                flags_ &= ~kFlagWantsTexture;
+        }
         [[nodiscard]] PIP3D_FORCE_INLINE float getQScale() const noexcept { return qScale_; }
 
         [[nodiscard]] PIP3D_FORCE_INLINE uint16_t maxChunkVertexCount() const noexcept

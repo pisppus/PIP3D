@@ -104,8 +104,8 @@ namespace pip3D
             const float dz_dx = (dz02 * dy12 - dy02 * dz12) * invDet;
             const float dz_dy = (dx02 * dz12 - dz02 * dx12) * invDet;
 
-            const float texW = tex.dimFlt();
-            const float texH = tex.dimFlt();
+            const float texW = tex.widthFlt();
+            const float texH = tex.heightFlt();
 
             const float tu0 = u0 * texW;
             const float tu1 = u1 * texW;
@@ -176,27 +176,37 @@ namespace pip3D
             const uint32_t fogColorG = g_fogState.color_g;
 
             const uint16_t *const __restrict__ texData = tex.data;
-            const uint32_t texShiftU = tex.shift;
-            const uint32_t texMaskU = tex.mask();
-            const uint32_t texMaskV = tex.mask();
+            const uint32_t texShiftU = tex.shiftU;
+            const uint32_t texMaskU = tex.maskU();
+            const uint32_t texMaskV = tex.maskV();
             const int32_t z_step = static_cast<int32_t>(dz_dx * 16384.0f);
 
             const uint16_t *const __restrict__ mipData = tex.mipData;
             const uint8_t maxMipLevel = tex.mipCount;
             const bool hasMipmaps = (maxMipLevel > 0 && mipData != nullptr && g_mipmapsEnabled);
-            const uint8_t baseShift = tex.shift;
+            const uint8_t baseShiftU = tex.shiftU;
+            const uint8_t baseShiftV = tex.vShift();
 
-            uint32_t mipOffsets[8];
+            static constexpr uint8_t MAX_MIP_TABLE = 16;
+            uint32_t mipOffsets[MAX_MIP_TABLE + 1];
+            uint8_t mipShiftUArr[MAX_MIP_TABLE];
+            uint8_t mipShiftVArr[MAX_MIP_TABLE];
             {
                 uint32_t offset = 0;
                 mipOffsets[0] = 0;
-                const uint8_t maxLevels = maxMipLevel < 8 ? maxMipLevel : 8;
+                const uint8_t maxLevels = (maxMipLevel < MAX_MIP_TABLE) ? maxMipLevel : MAX_MIP_TABLE;
                 for (uint8_t k = 0; k < maxLevels; ++k)
                 {
-                    const uint8_t mipShift = baseShift - (k + 1);
-                    const uint32_t mipSize = (mipShift > 0) ? (1U << (2 * mipShift)) : 1U;
+
+                    const uint8_t su = (baseShiftU > (k + 1)) ? static_cast<uint8_t>(baseShiftU - (k + 1)) : 0;
+                    const uint8_t sv = (baseShiftV > (k + 1)) ? static_cast<uint8_t>(baseShiftV - (k + 1)) : 0;
+                    const uint32_t mipW = 1u << su;
+                    const uint32_t mipH = 1u << sv;
+                    const uint32_t mipSize = mipW * mipH;
                     offset += mipSize;
                     mipOffsets[k + 1] = offset;
+                    mipShiftUArr[k] = su;
+                    mipShiftVArr[k] = sv;
                 }
             }
 
@@ -284,7 +294,6 @@ namespace pip3D
                     uint32_t chunkTexMaskU = texMaskU;
                     uint32_t chunkTexMaskV = texMaskV;
                     int32_t chunkUVShift = 0;
-                    int32_t chunkLod = 0;
                     const uint16_t *chunkTexDataHi = texData;
                     uint32_t chunkTexShiftHi = texShiftU;
                     uint32_t chunkTexMaskUHi = texMaskU;
@@ -293,68 +302,78 @@ namespace pip3D
 
                     if (hasMipmaps)
                     {
+
                         const float inv_q = FastMath::fastReciprocal(q);
-                        const float du_dx_scr = (du_over_z_dx - u * dq_dx) * inv_q;
-                        const float dv_dx_scr = (dv_over_z_dx - v * dq_dx) * inv_q;
-                        const float du_dy_scr = (du_over_z_dy - u * dq_dy) * inv_q;
-                        const float dv_dy_scr = (dv_over_z_dy - v * dq_dy) * inv_q;
-                        const float du_dx_a = du_dx_scr < 0.0f ? -du_dx_scr : du_dx_scr;
-                        const float dv_dx_a = dv_dx_scr < 0.0f ? -dv_dx_scr : dv_dx_scr;
-                        const float du_dy_a = du_dy_scr < 0.0f ? -du_dy_scr : du_dy_scr;
-                        const float dv_dy_a = dv_dy_scr < 0.0f ? -dv_dy_scr : dv_dy_scr;
-                        float dmax = du_dx_a;
-                        if (dv_dx_a > dmax)
-                            dmax = dv_dx_a;
-                        if (du_dy_a > dmax)
-                            dmax = du_dy_a;
-                        if (dv_dy_a > dmax)
-                            dmax = dv_dy_a;
-
-                        if (dmax > 1.0f)
+                        const bool qValid = (q > 1e-6f) && (q < 1e6f) && (inv_q > 1e-6f) && (inv_q < 1e6f);
+                        if (qValid)
                         {
-                            uint32_t bits;
-                            std::memcpy(&bits, &dmax, sizeof(bits));
-                            float lodLevel = static_cast<float>(static_cast<int32_t>((bits >> 23) & 0xFF) - 127);
-                            lodLevel += static_cast<float>((bits >> 15) & 0xFF) * (1.0f / 256.0f);
+                            const float du_dx_scr = (du_over_z_dx - u * dq_dx) * inv_q;
+                            const float dv_dx_scr = (dv_over_z_dx - v * dq_dx) * inv_q;
+                            const float du_dy_scr = (du_over_z_dy - u * dq_dy) * inv_q;
+                            const float dv_dy_scr = (dv_over_z_dy - v * dq_dy) * inv_q;
+                            const float du_dx_a = du_dx_scr < 0.0f ? -du_dx_scr : du_dx_scr;
+                            const float dv_dx_a = dv_dx_scr < 0.0f ? -dv_dx_scr : dv_dx_scr;
+                            const float du_dy_a = du_dy_scr < 0.0f ? -du_dy_scr : du_dy_scr;
+                            const float dv_dy_a = dv_dy_scr < 0.0f ? -dv_dy_scr : dv_dy_scr;
+                            float dmax = du_dx_a;
+                            if (dv_dx_a > dmax)
+                                dmax = dv_dx_a;
+                            if (du_dy_a > dmax)
+                                dmax = du_dy_a;
+                            if (dv_dy_a > dmax)
+                                dmax = dv_dy_a;
 
-                            if (lodLevel < 0.0f)
-                                lodLevel = 0.0f;
-                            if (lodLevel > static_cast<float>(maxMipLevel))
-                                lodLevel = static_cast<float>(maxMipLevel);
-
-                            const int32_t intLod = static_cast<int32_t>(lodLevel);
-                            chunkFracLod = static_cast<uint32_t>((lodLevel - static_cast<float>(intLod)) * 256.0f);
-                            chunkLod = intLod;
-                            (void)chunkLod;
-
-                            if (intLod == 0)
+                            if (dmax > 1.0f && dmax < 1e8f)
                             {
-                                chunkTexData = texData;
-                                chunkTexShift = texShiftU;
-                                chunkTexMaskU = texMaskU;
-                                chunkTexMaskV = texMaskV;
-                                chunkUVShift = 0;
-                            }
-                            else
-                            {
-                                const uint32_t mipShift = baseShift - intLod;
-                                chunkTexData = mipData + mipOffsets[intLod - 1];
-                                chunkTexShift = mipShift;
-                                chunkTexMaskU = (1U << mipShift) - 1U;
-                                chunkTexMaskV = chunkTexMaskU;
-                                chunkUVShift = intLod;
-                            }
+                                uint32_t bits;
+                                std::memcpy(&bits, &dmax, sizeof(bits));
+                                float lodLevel = static_cast<float>(static_cast<int32_t>((bits >> 23) & 0xFF) - 127);
+                                lodLevel += static_cast<float>((bits >> 15) & 0xFF) * (1.0f / 256.0f);
 
-                            const int32_t hiLod = intLod + 1;
-                            if (hiLod <= static_cast<int32_t>(maxMipLevel) && chunkFracLod > 0)
-                            {
-                                const uint32_t mipShiftHi = baseShift - hiLod;
-                                chunkTexDataHi = mipData + mipOffsets[hiLod - 1];
-                                chunkTexShiftHi = mipShiftHi;
-                                chunkTexMaskUHi = (1U << mipShiftHi) - 1U;
-                                chunkTexMaskVHi = chunkTexMaskUHi;
-                                chunkUVShiftHi = hiLod;
-                                chunkDither = true;
+                                lodLevel += g_mipmapBias;
+
+                                if (lodLevel < 0.0f)
+                                    lodLevel = 0.0f;
+                                if (lodLevel > static_cast<float>(maxMipLevel))
+                                    lodLevel = static_cast<float>(maxMipLevel);
+
+                                const int32_t intLod = static_cast<int32_t>(lodLevel);
+                                const int32_t intLodClamped = (intLod > static_cast<int32_t>(MAX_MIP_TABLE))
+                                                                  ? static_cast<int32_t>(MAX_MIP_TABLE)
+                                                                  : intLod;
+                                chunkFracLod = static_cast<uint32_t>((lodLevel - static_cast<float>(intLod)) * 256.0f);
+
+                                if (intLodClamped == 0)
+                                {
+                                    chunkTexData = texData;
+                                    chunkTexShift = texShiftU;
+                                    chunkTexMaskU = texMaskU;
+                                    chunkTexMaskV = texMaskV;
+                                    chunkUVShift = 0;
+                                }
+                                else
+                                {
+                                    const uint8_t su = mipShiftUArr[intLodClamped - 1];
+                                    const uint8_t sv = mipShiftVArr[intLodClamped - 1];
+                                    chunkTexData = mipData + mipOffsets[intLodClamped - 1];
+                                    chunkTexShift = su;
+                                    chunkTexMaskU = (1U << su) - 1U;
+                                    chunkTexMaskV = (1U << sv) - 1U;
+                                    chunkUVShift = intLodClamped;
+                                }
+
+                                const int32_t hiLod = intLodClamped + 1;
+                                if (hiLod <= static_cast<int32_t>(maxMipLevel) && hiLod <= static_cast<int32_t>(MAX_MIP_TABLE) && chunkFracLod > 0)
+                                {
+                                    const uint8_t suHi = mipShiftUArr[hiLod - 1];
+                                    const uint8_t svHi = mipShiftVArr[hiLod - 1];
+                                    chunkTexDataHi = mipData + mipOffsets[hiLod - 1];
+                                    chunkTexShiftHi = suHi;
+                                    chunkTexMaskUHi = (1U << suHi) - 1U;
+                                    chunkTexMaskVHi = (1U << svHi) - 1U;
+                                    chunkUVShiftHi = hiLod;
+                                    chunkDither = true;
+                                }
                             }
                         }
                     }
@@ -391,7 +410,7 @@ namespace pip3D
                             {
                                 *zb = d;
 #if PIP3D_DEBUG_MIPMAP
-                                const uint16_t texColor = kDebugMipColors[chunkLod < 7 ? chunkLod : 7];
+                                const uint16_t texColor = kDebugMipColors[chunkUVShift < 7 ? chunkUVShift : 7];
 #else
                                 const uint32_t tu = (static_cast<uint32_t>(u_fixed >> (16 + cush))) & cmaskU;
                                 const uint32_t tv = (static_cast<uint32_t>(v_fixed >> (16 + cush))) & cmaskV;
@@ -480,7 +499,7 @@ namespace pip3D
                                 const bool useHi = (chunkFracLod > bayer);
 
 #if PIP3D_DEBUG_MIPMAP
-                                const int32_t vizLod = useHi ? chunkUVShiftHi : chunkLod;
+                                const int32_t vizLod = useHi ? chunkUVShiftHi : chunkUVShift;
                                 const uint16_t texColor = kDebugMipColors[vizLod < 7 ? vizLod : 7];
 #else
                                 const uint16_t *td;

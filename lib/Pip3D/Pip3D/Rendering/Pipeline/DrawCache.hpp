@@ -18,7 +18,7 @@ namespace pip3D
         DrawCache(DrawCache &&) = delete;
         DrawCache &operator=(DrawCache &&) = delete;
 
-        PIP3D_HOT bool ensureCapacity(uint16_t required) noexcept;
+        PIP3D_HOT bool ensureCapacity(uint16_t required, bool withNormals = false) noexcept;
 
         enum class ProjState : uint8_t
         {
@@ -57,6 +57,9 @@ namespace pip3D
         PIP3D_FORCE_INLINE Vector3 *worldVerts() noexcept { return storage_; }
         PIP3D_FORCE_INLINE const Vector3 *worldVerts() const noexcept { return storage_; }
 
+        PIP3D_FORCE_INLINE Vector3 *worldNormals() noexcept { return worldNormals_; }
+        PIP3D_FORCE_INLINE const Vector3 *worldNormals() const noexcept { return worldNormals_; }
+
         PIP3D_FORCE_INLINE Vector3 *screenVerts() noexcept { return screenVerts_; }
         PIP3D_FORCE_INLINE const Vector3 *screenVerts() const noexcept { return screenVerts_; }
 
@@ -80,6 +83,7 @@ namespace pip3D
         }
 
         Vector3 *storage_ = nullptr;
+        Vector3 *worldNormals_ = nullptr;
         Vector3 *screenVerts_ = nullptr;
         uint16_t capacity_ = 0;
 

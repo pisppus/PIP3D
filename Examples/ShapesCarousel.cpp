@@ -1,10 +1,12 @@
-#include <Arduino.h>
-#include <algorithm>
-#include <array>
-#include <vector>
-#include <math.h>
-#include <stdio.h>
-#if defined(PIP3D_PC)
+#include <cstdio>
+#include <cmath>
+
+#if !defined(PIP3D_PC)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_timer.h>
+#include <driver/uart.h>
+#else
 #include <PipCore/Platforms/Desktop/Runtime.hpp>
 #endif
 
@@ -39,7 +41,6 @@ static MeshInstance *g_figCylinder = nullptr;
 static MeshInstance *g_figKnot = nullptr;
 
 static float g_demoTime = 0.0f;
-static uint32_t g_lastMs = 0;
 
 static void initMeshes()
 {
@@ -177,15 +178,17 @@ static void drawHud(Renderer &r)
     r.drawText(12, 226, buf, Color::BLACK);
 }
 
-void setup()
+extern "C" void app_main(void)
 {
-    Serial.begin(115200);
+#if !defined(PIP3D_PC)
+    vTaskDelay(pdMS_TO_TICKS(100));
+#endif
+
     Renderer &r = begin3D(SCREEN_WIDTH, SCREEN_HEIGHT, TFT_CS_PIN, TFT_DC_PIN, TFT_RST_PIN, TFT_BL_PIN, 80000000);
     if (!r.isInitialized())
     {
-        Serial.println("Pip3D init failed");
-        for (;;)
-            delay(1000);
+        std::printf("Pip3D init failed\n");
+        return;
     }
 
     r.setShadingMode(SHADING_GOURAUD);
@@ -215,40 +218,37 @@ void setup()
     r.setShadowOpacity(0.38f);
     r.setShadowColor(Color::fromRGB888(16, 20, 28));
 
-    g_lastMs = millis();
     g_demoTime = 0.0f;
-}
+    uint64_t lastTickUs = 0;
 
-void loop()
-{
-    uint32_t now = millis();
-    uint32_t dtMs = now - g_lastMs;
-    g_lastMs = now;
-    float dt = dtMs * 0.001f;
-
-    if (dt < 0.001f)
-        dt = 0.001f;
-    if (dt > 0.05f)
-        dt = 0.05f;
-
-    Renderer &r = renderer();
-    if (!r.isInitialized())
+    while (true)
     {
-        delay(100);
-        return;
-    }
+#if defined(PIP3D_PC)
+        if (pipcore::desktop::Runtime::instance().shouldQuit())
+            break;
+#endif
 
-    updateScene(r, dt);
+        const uint64_t nowUs = pip3D::getSystemMicros();
+        float dt = (lastTickUs == 0) ? 0.016f : static_cast<float>(nowUs - lastTickUs) * 1e-6f;
+        lastTickUs = nowUs;
 
-    for (int band = 0; band < SCREEN_BAND_COUNT; ++band)
-    {
-        r.beginFrameBand(band);
-        r.drawSkyboxBackground();
+        if (dt < 0.001f)
+            dt = 0.001f;
+        if (dt > 0.05f)
+            dt = 0.05f;
 
-        renderWorld(r);
-        r.flushQueue();
-        drawHud(r);
- 
-        r.endFrameBand(band);
+        updateScene(r, dt);
+
+        for (int band = 0; band < SCREEN_BAND_COUNT; ++band)
+        {
+            r.beginFrameBand(band);
+            r.drawSkyboxBackground();
+
+            renderWorld(r);
+            r.flushQueue();
+            drawHud(r);
+
+            r.endFrameBand(band);
+        }
     }
 }

@@ -105,12 +105,10 @@ namespace pip3D
         };
     }
 
-    // Texture struct layout (12 bytes):
-    //   data, mipData, shift, mipCount
     inline Texture g_sunTexture = {
         .data     = detail::s_sunTextureData,
         .mipData  = nullptr,
-        .shift    = 5,
+        .shiftU   = 5,
         .mipCount = 0
     };
 }

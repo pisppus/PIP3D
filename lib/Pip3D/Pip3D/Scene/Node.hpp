@@ -423,10 +423,10 @@ namespace pip3D
         void setFOV(float fieldOfView) { fov = fieldOfView; }
         float getFOV() const { return fov; }
 
-        void setNearPlane(float near) { nearPlane = near; }
+        void setNearPlane(float nearDist) { nearPlane = nearDist; }
         float getNearPlane() const { return nearPlane; }
 
-        void setFarPlane(float far) { farPlane = far; }
+        void setFarPlane(float farDist) { farPlane = farDist; }
         float getFarPlane() const { return farPlane; }
 
         void applyToCamera(class Camera &camera)

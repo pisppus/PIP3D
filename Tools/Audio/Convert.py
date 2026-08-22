@@ -708,23 +708,14 @@ def process_audio(file_path, force_source_rate=None):
     return name_no_ext, payload, info, src_channels, src_rate
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pip3D PAC encoder")
-    parser.add_argument("input",  help="Input audio file (wav/mp3/ogg/flac)")
-    parser.add_argument("output", help="Output .hpp file")
-    parser.add_argument("--source-rate", type=int, default=None,
-                        help="Force source rate (11025/22050/44100). Default: auto.")
-    parser.add_argument("--no-viz", action="store_true",
-                        help="Skip PNG visualisation output")
-    args = parser.parse_args()
-
-    name, payload, info, src_ch, src_rate = process_audio(args.input, force_source_rate=args.source_rate)
+def convert_one(input_path, output_path, force_source_rate=None, no_viz=False):
+    name, payload, info, src_ch, src_rate = process_audio(input_path, force_source_rate=force_source_rate)
     if payload is None:
-        print(f"\033[91m[PAC] Failed to encode {args.input}\033[0m")
+        print(f"\033[91m[PAC] Failed to encode {input_path}\033[0m")
         sys.exit(1)
 
-    export_hpp(name, payload, info, src_ch, src_rate, args.output)
-    print(f"\033[32m[PAC]\033[0m {args.input} -> {args.output}")
+    export_hpp(name, payload, info, src_ch, src_rate, output_path)
+    print(f"\033[32m[PAC]\033[0m {input_path} -> {output_path}")
     print(f"       Profile: {info['profile']}")
     print(f"       Source: {info['source_rate']} Hz, {info['frame_count']} samples, "
           f"{info['frame_count'] / info['source_rate']:.2f} s")
@@ -733,33 +724,55 @@ if __name__ == "__main__":
     print(f"       Modes: silence={info['mode_stats'].get(0,0)} 2bit={info['mode_stats'].get(1,0)} "
           f"4bit={info['mode_stats'].get(2,0)} 6bit={info['mode_stats'].get(3,0)} hold={info['mode_stats'].get(4,0)}")
 
-    if not args.no_viz:
-        hpp_abs = os.path.abspath(args.output)
-        parts = hpp_abs.split(os.sep)
-        candidates = []
-        if 'lib' in parts:
-            lib_idx = parts.index('lib')
-            project_root = os.sep.join(parts[:lib_idx])
-            candidates.append(os.path.join(project_root, 'Tools', 'Audio', 'Output'))
-        candidates.append(os.path.join(os.getcwd(), 'Tools', 'Audio', 'Output'))
+    if no_viz:
+        return
 
-        viz_dir = None
-        for c in candidates:
-            try:
-                os.makedirs(c, exist_ok=True)
-                test_file = os.path.join(c, '.viz_test')
-                with open(test_file, 'w') as f:
-                    f.write('test')
-                os.remove(test_file)
-                viz_dir = c
-                break
-            except (OSError, PermissionError):
-                continue
+    hpp_abs = os.path.abspath(output_path)
+    parts = hpp_abs.split(os.sep)
+    candidates = []
+    if 'lib' in parts:
+        lib_idx = parts.index('lib')
+        project_root = os.sep.join(parts[:lib_idx])
+        candidates.append(os.path.join(project_root, 'Tools', 'Audio', 'Output'))
+    candidates.append(os.path.join(os.getcwd(), 'Tools', 'Audio', 'Output'))
 
-        if viz_dir is None:
-            viz_dir = os.path.dirname(os.path.abspath(args.output))
+    viz_dir = None
+    for c in candidates:
+        try:
+            os.makedirs(c, exist_ok=True)
+            test_file = os.path.join(c, '.viz_test')
+            with open(test_file, 'w') as f:
+                f.write('test')
+            os.remove(test_file)
+            viz_dir = c
+            break
+        except (OSError, PermissionError):
+            continue
 
-        viz_path = os.path.join(viz_dir, f"{name}.png")
-        ok = export_visualisation(name, info, src_ch, src_rate, viz_path)
-        if ok:
-            print(f"       Visualisation: {viz_path}")
+    if viz_dir is None:
+        viz_dir = os.path.dirname(os.path.abspath(output_path))
+
+    viz_path = os.path.join(viz_dir, f"{name}.png")
+    ok = export_visualisation(name, info, src_ch, src_rate, viz_path)
+    if ok:
+        print(f"       Visualisation: {viz_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Pip3D PAC encoder")
+    parser.add_argument("pairs", nargs="+",
+                        help="input output, or in1 out1 in2 out2 ... for batch")
+    parser.add_argument("--source-rate", type=int, default=None,
+                        help="Force source rate (11025/22050/44100). Default: auto.")
+    parser.add_argument("--no-viz", action="store_true",
+                        help="Skip PNG visualisation output")
+    args = parser.parse_args()
+
+    files = args.pairs
+    if len(files) % 2 != 0:
+        parser.error("expected input/output pairs: in1 out1 [in2 out2 ...]")
+
+    for i in range(0, len(files), 2):
+        convert_one(files[i], files[i + 1],
+                    force_source_rate=args.source_rate,
+                    no_viz=args.no_viz)
