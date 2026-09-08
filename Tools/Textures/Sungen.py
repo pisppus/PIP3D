@@ -158,7 +158,7 @@ def main():
     pixels, preview = gen_sun_pixels(size, disk_r, halo_r)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    sources_dir = os.path.join(script_dir, "Sources")
+    sources_dir = os.path.join(script_dir, "Asset")
     os.makedirs(sources_dir, exist_ok=True)
     preview_path = os.path.join(sources_dir, PREVIEW_NAME)
     Image.fromarray(_to_array(preview, size), "RGB").save(preview_path)

@@ -1,0 +1,568 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Tris { uint g_tris[]; };
+layout(std430, binding = 1) readonly buffer Nodes { uint g_nodes[]; };
+layout(std430, binding = 2) readonly buffer Texels { uint g_texels[]; };
+layout(std430, binding = 3) readonly buffer Lights { uint g_lights[]; };
+layout(std430, binding = 4) readonly buffer Emi { uint g_emi[]; };
+layout(std430, binding = 5) readonly buffer TexW { uint g_texw[]; };
+layout(std430, binding = 6) readonly buffer TexM { uint g_texm[]; };
+layout(std430, binding = 7) readonly buffer BN { uint g_bn[]; };
+layout(std430, binding = 8) readonly buffer Par { uint g_par[]; };
+layout(std430, binding = 9) readonly buffer TriIdx { uint g_triIdx[]; };
+layout(std430, binding = 10) buffer OutDen { uint o_den[]; };
+layout(std430, binding = 11) buffer OutVar { uint o_var[]; };
+layout(std430, binding = 12) buffer OutStl { uint o_stl[]; };
+layout(std430, binding = 13) buffer OutStc { uint o_stc[]; };
+#define TRI_BYTES 88
+#define NODE_BYTES 40
+#define pSunDirTo 0
+#define pSunCol 3
+#define pSkyTop 6
+#define pSkyHor 9
+#define pSkyGnd 12
+#define pSkyAvg 15
+#define pSkyLevel 18
+#define pSkyNeut 19
+#define pWrap 20
+#define pDiffScale 21
+#define pSmoothEps 22
+#define pGiGain 23
+#define pGiMaxAlbedo 24
+#define pGiDesat 25
+#define pAoDist 26
+#define pBias 27
+#define pSunRadius 28
+#define pEmiArea 29
+#define pFinalMode 30
+#define pLightCount 31
+#define pEmiCount 32
+#define pSunRays 33
+#define pAoRays 34
+#define pGiRays 35
+#define pGiNee 36
+#define pSeedBase 37
+#define pTexelCount 38
+#define pRW 39
+#define pRH 40
+#define pSunT1 41
+#define pSunT2 44
+#define pEmiSamp 47
+#define pNodeCount 48
+#define pTexWordCnt 49
+#define pTexelBase 50
+#define pHasSun 51
+vec3 loadVec3FromTris(uint byteAddr) {
+    uint i = byteAddr >> 2;
+    return vec3(uintBitsToFloat(g_tris[i]), uintBitsToFloat(g_tris[i + 1]), uintBitsToFloat(g_tris[i + 2]));
+}
+vec3 loadVec3FromNodes(uint byteAddr) {
+    uint i = byteAddr >> 2;
+    return vec3(uintBitsToFloat(g_nodes[i]), uintBitsToFloat(g_nodes[i + 1]), uintBitsToFloat(g_nodes[i + 2]));
+}
+vec3 loadVec3FromTexels(uint byteAddr) {
+    uint i = byteAddr >> 2;
+    return vec3(uintBitsToFloat(g_texels[i]), uintBitsToFloat(g_texels[i + 1]), uintBitsToFloat(g_texels[i + 2]));
+}
+vec3 loadVec3FromLights(uint byteAddr) {
+    uint i = byteAddr >> 2;
+    return vec3(uintBitsToFloat(g_lights[i]), uintBitsToFloat(g_lights[i + 1]), uintBitsToFloat(g_lights[i + 2]));
+}
+vec3 loadVec3FromEmi(uint byteAddr) {
+    uint i = byteAddr >> 2;
+    return vec3(uintBitsToFloat(g_emi[i]), uintBitsToFloat(g_emi[i + 1]), uintBitsToFloat(g_emi[i + 2]));
+}
+vec3 loadVec3FromPar(uint byteAddr) {
+    uint i = byteAddr >> 2;
+    return vec3(uintBitsToFloat(g_par[i]), uintBitsToFloat(g_par[i + 1]), uintBitsToFloat(g_par[i + 2]));
+}
+void storeVec3Den(uint byteAddr, vec3 v) {
+    uint i = byteAddr >> 2;
+    o_den[i] = floatBitsToUint(v.x);
+    o_den[i + 1] = floatBitsToUint(v.y);
+    o_den[i + 2] = floatBitsToUint(v.z);
+}
+void storeVec3Stc(uint byteAddr, vec3 v) {
+    uint i = byteAddr >> 2;
+    o_stc[i] = floatBitsToUint(v.x);
+    o_stc[i + 1] = floatBitsToUint(v.y);
+    o_stc[i + 2] = floatBitsToUint(v.z);
+}
+uint hashPcg(uint v) {
+    v = v * 747796405u + 2891336453u;
+    uint w = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+uint pcg3d(uint a, uint b, uint c) {
+    return hashPcg(a * 0x9E3779B1u ^ b * 0x85EBCA77u ^ c * 0xC2B2AE3Du);
+}
+uint rnd(inout uint s) {
+    s = s * 747796405u + 2891336453u;
+    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+float r01(inout uint s) {
+    return (rnd(s) & 0xFFFFFFu) * (1.0 / 16777216.0);
+}
+float halton(uint idx, uint base) {
+    float f = 1.0;
+    float r = 0.0;
+    while (idx > 0u) {
+        f /= float(base);
+        r += f * float(idx % base);
+        idx /= base;
+    }
+    return r;
+}
+float halton01(inout uint s, uint base) {
+    uint idx = s++;
+    return halton(idx, base);
+}
+float lum3(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+float bnCh(uint x, uint y, uint ch) {
+    const ivec2 off[4] = ivec2[4](ivec2(0, 0), ivec2(89, 47), ivec2(37, 101), ivec2(113, 73));
+    x += uint(off[ch & 3u].x);
+    y += uint(off[ch & 3u].y);
+    return float(g_bn[((y & 127u) << 7) | (x & 127u)]) * (1.0 / 16384.0);
+}
+void tangentBasis(vec3 n, out vec3 t1, out vec3 t2) {
+    vec3 ref = abs(n.y) < 0.9 ? vec3(0, 1, 0) : vec3(1, 0, 0);
+    t1 = cross(ref, n);
+    float len = length(t1);
+    t1 = len > 1e-6 ? t1 / len : vec3(1, 0, 0);
+    t2 = cross(n, t1);
+}
+float smoothPosRT(float x, float eps) {
+    if (x <= 0.0) return 0.0;
+    if (x < eps) {
+        float u = x / eps;
+        return u * u * (2.0 - u) * eps;
+    }
+    return x;
+}
+vec3 skyColorForDir(vec3 dir, float neut) {
+    vec3 top = loadVec3FromPar(pSkyTop * 4);
+    vec3 hor = loadVec3FromPar(pSkyHor * 4);
+    vec3 gnd = loadVec3FromPar(pSkyGnd * 4);
+    float y = dir.y;
+    vec3 c;
+    if (y >= 0.0) {
+        float t = min(1.0, y * 1.6);
+        float s = t * t * (3.0 - 2.0 * t);
+        c = hor + (top - hor) * s;
+    } else {
+        float t = min(1.0, -y * 1.6);
+        float s = t * t * (3.0 - 2.0 * t);
+        c = hor + (gnd - hor) * s;
+    }
+    if (neut > 0.0) {
+        float l = lum3(c);
+        float k = min(1.0, neut);
+        c = c + (vec3(l) - c) * k;
+    }
+    return c;
+}
+struct Hit {
+    float t;
+    float u;
+    float v;
+    uint tri;
+};
+void triData(uint ti, out vec3 v0, out vec3 e1, out vec3 e2, out vec3 gn, out vec3 alb, out int texSlot, out vec4 uvA, out vec4 uvB) {
+    uint base = ti * TRI_BYTES;
+    v0 = loadVec3FromTris(base);
+    e1 = loadVec3FromTris(base + 12);
+    e2 = loadVec3FromTris(base + 24);
+    gn = loadVec3FromTris(base + 36);
+    alb = loadVec3FromTris(base + 48);
+    texSlot = int(g_tris[(base + 60) >> 2]);
+    uvA = vec4(uintBitsToFloat(g_tris[(base + 64) >> 2]), uintBitsToFloat(g_tris[(base + 68) >> 2]), uintBitsToFloat(g_tris[(base + 72) >> 2]), uintBitsToFloat(g_tris[(base + 76) >> 2]));
+    uvB = vec4(uintBitsToFloat(g_tris[(base + 80) >> 2]), uintBitsToFloat(g_tris[(base + 84) >> 2]), 0, 0);
+}
+bool triHitOccl(uint ti, vec3 ro, vec3 rd, float maxDist) {
+    vec3 v0, e1, e2, gn, alb;
+    int slot;
+    vec4 a, b;
+    triData(ti, v0, e1, e2, gn, alb, slot, a, b);
+    vec3 px = cross(rd, e2);
+    float det = dot(e1, px);
+    if (abs(det) < 1e-12) return false;
+    float invDet = 1.0 / det;
+    vec3 s = ro - v0;
+    float u = dot(s, px) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+    vec3 q = cross(s, e1);
+    float v = dot(rd, q) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+    float t = dot(e2, q) * invDet;
+    return t > 1e-4 && t < maxDist;
+}
+bool triHitClosest(uint ti, vec3 ro, vec3 rd, float maxDist, out Hit h) {
+    h.t = maxDist;
+    h.u = 0;
+    h.v = 0;
+    h.tri = ti;
+    vec3 v0, e1, e2, gn, alb;
+    int slot;
+    vec4 a, b;
+    triData(ti, v0, e1, e2, gn, alb, slot, a, b);
+    vec3 px = cross(rd, e2);
+    float det = dot(e1, px);
+    if (abs(det) < 1e-12) return false;
+    float invDet = 1.0 / det;
+    vec3 s = ro - v0;
+    float u = dot(s, px) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+    vec3 q = cross(s, e1);
+    float v = dot(rd, q) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+    float t = dot(e2, q) * invDet;
+    if (t <= 1e-4 || t >= maxDist) return false;
+    h.t = t;
+    h.u = u;
+    h.v = v;
+    return true;
+}
+float safeInv(float d) {
+    float ad = abs(d) < 1e-12 ? (d < 0 ? -1e-12 : 1e-12) : d;
+    return 1.0 / ad;
+}
+bool nodeSlab(uint nb, vec3 ro, vec3 invD, float maxDist, out float tmin, out float tmax) {
+    vec3 mn = loadVec3FromNodes(nb);
+    vec3 mx = loadVec3FromNodes(nb + 12);
+    vec3 t1 = (mn - ro) * invD;
+    vec3 t2 = (mx - ro) * invD;
+    vec3 lo = min(t1, t2);
+    vec3 hi = max(t1, t2);
+    tmin = max(max(lo.x, lo.y), lo.z);
+    tmax = min(min(hi.x, hi.y), hi.z);
+    return tmin <= tmax && tmax >= 0.0;
+}
+bool rayOccluded(vec3 ro, vec3 rd, float maxDist) {
+    if (g_par[pNodeCount] == 0) return false;
+    vec3 invD = vec3(safeInv(rd.x), safeInv(rd.y), safeInv(rd.z));
+    uint stack[96];
+    int sp = 0;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        uint nb = stack[--sp] * NODE_BYTES;
+        float tmin, tmax;
+        if (!nodeSlab(nb, ro, invD, maxDist, tmin, tmax)) continue;
+        uint left = g_nodes[(nb + 24) >> 2];
+        if (left == 0xFFFFFFFFu) {
+            uint start = g_nodes[(nb + 32) >> 2];
+            uint count = g_nodes[(nb + 36) >> 2];
+            for (uint i = start; i < start + count; ++i) if (triHitOccl(g_triIdx[i], ro, rd, maxDist)) return true;
+        } else if (sp + 2 <= 96) {
+            stack[sp++] = left;
+            stack[sp++] = g_nodes[(nb + 28) >> 2];
+        }
+    }
+    return false;
+}
+bool traceAny(vec3 ro, vec3 rd, float maxDist, out Hit best) {
+    best.t = maxDist;
+    best.u = 0;
+    best.v = 0;
+    best.tri = 0xFFFFFFFFu;
+    if (g_par[pNodeCount] == 0) return false;
+    vec3 invD = vec3(safeInv(rd.x), safeInv(rd.y), safeInv(rd.z));
+    uint stack[96];
+    int sp = 0;
+    stack[sp++] = 0;
+    float bestT = maxDist;
+    bool found = false;
+    while (sp > 0) {
+        uint nb = stack[--sp] * NODE_BYTES;
+        float tmin, tmax;
+        if (!nodeSlab(nb, ro, invD, maxDist, tmin, tmax) || tmin > bestT) continue;
+        uint left = g_nodes[(nb + 24) >> 2];
+        if (left == 0xFFFFFFFFu) {
+            uint start = g_nodes[(nb + 32) >> 2];
+            uint count = g_nodes[(nb + 36) >> 2];
+            for (uint i = start; i < start + count; ++i) {
+                Hit h;
+                if (triHitClosest(g_triIdx[i], ro, rd, bestT, h)) {
+                    bestT = h.t;
+                    best = h;
+                    found = true;
+                }
+            }
+        } else if (sp + 2 <= 96) {
+            uint r = g_nodes[(nb + 28) >> 2];
+            float lt, lmx, rt, rmx;
+            bool lOk = nodeSlab(left * NODE_BYTES, ro, invD, maxDist, lt, lmx) && lt <= bestT;
+            bool rOk = nodeSlab(r * NODE_BYTES, ro, invD, maxDist, rt, rmx) && rt <= bestT;
+            if (lOk && rOk) {
+                if (lt < rt) { stack[sp++] = r; stack[sp++] = left; }
+                else         { stack[sp++] = left; stack[sp++] = r; }
+            } else if (lOk) stack[sp++] = left;
+            else if (rOk) stack[sp++] = r;
+        }
+    }
+    return found;
+}
+void albedoAt(Hit h, inout vec3 alb) {
+    vec3 v0, e1, e2, gn, a0;
+    int slot;
+    vec4 uvA, uvB;
+    triData(h.tri, v0, e1, e2, gn, a0, slot, uvA, uvB);
+    alb = a0;
+    if (slot >= 0 && g_par[pTexWordCnt] > 0) {
+        uint mb = uint(slot) * 10u;
+        float w0 = 1.0 - h.u - h.v;
+        float tu = uvA.x * w0 + uvA.z * h.u + uvB.x * h.v;
+        float tv = uvA.y * w0 + uvA.w * h.u + uvB.y * h.v;
+        tu -= floor(tu);
+        tv -= floor(tv);
+        float wf = uintBitsToFloat(g_texm[mb + 6]);
+        float hf = uintBitsToFloat(g_texm[mb + 7]);
+        uint mu = g_texm[mb + 3];
+        uint mv = g_texm[mb + 4];
+        uint su = g_texm[mb + 5];
+        uint tx = uint(tu * wf) & mu;
+        uint ty = uint(tv * hf) & mv;
+        uint off = g_texm[mb];
+        uint c = g_texw[off + ((ty << su) | tx)];
+        alb *= vec3((c >> 11) & 31u, (c >> 5) & 63u, c & 31u) * vec3(1.0 / 31.0, 1.0 / 63.0, 1.0 / 31.0);
+    }
+}
+void main() {
+    uint gid = g_par[pTexelBase] + gl_GlobalInvocationID.x;
+    uint n = g_par[pTexelCount];
+    if (gid >= n) return;
+    uint face = g_texels[(gid * 8) + 6];
+    if (face == 0xFFFFFFFFu) {
+        storeVec3Den(gid * 12, vec3(0));
+        o_var[gid] = 0;
+        o_stl[gid] = 0;
+        storeVec3Stc(gid * 12, vec3(0));
+        return;
+    }
+    vec3 pos = loadVec3FromTexels(gid * 32);
+    vec3 nrm = loadVec3FromTexels(gid * 32 + 12);
+    vec3 sunDirTo = loadVec3FromPar(pSunDirTo * 4);
+    vec3 sunCol = loadVec3FromPar(pSunCol * 4);
+    vec3 skyAvgCol = loadVec3FromPar(pSkyAvg * 4);
+    float skyLevel = uintBitsToFloat(g_par[pSkyLevel]);
+    float neut = uintBitsToFloat(g_par[pSkyNeut]);
+    float wrapTerm = uintBitsToFloat(g_par[pWrap]);
+    float diffScale = uintBitsToFloat(g_par[pDiffScale]);
+    float smoothEps = uintBitsToFloat(g_par[pSmoothEps]);
+    float giGain = uintBitsToFloat(g_par[pGiGain]);
+    float giMaxAlbedo = uintBitsToFloat(g_par[pGiMaxAlbedo]);
+    float giDesat = uintBitsToFloat(g_par[pGiDesat]);
+    float aoDist = uintBitsToFloat(g_par[pAoDist]);
+    float bias = uintBitsToFloat(g_par[pBias]);
+    float sunRadius = uintBitsToFloat(g_par[pSunRadius]);
+    float emiArea = uintBitsToFloat(g_par[pEmiArea]);
+    bool finalMode = g_par[pFinalMode] != 0;
+    bool hasSun = g_par[pHasSun] != 0u;
+    uint lightCount = g_par[pLightCount];
+    uint emiCount = g_par[pEmiCount];
+    uint sunRays = g_par[pSunRays];
+    uint aoRays = g_par[pAoRays];
+    uint giRays = g_par[pGiRays];
+    uint giNee = g_par[pGiNee];
+    uint seedBase = g_par[pSeedBase];
+    uint rw = g_par[pRW];
+    uint emSamp = g_par[pEmiSamp];
+    vec3 sunT1 = loadVec3FromPar(pSunT1 * 4);
+    vec3 sunT2 = loadVec3FromPar(pSunT2 * 4);
+    uint tx = gid % rw;
+    uint ty = gid / rw;
+    vec3 sp = pos + nrm * bias;
+    uint rng = pcg3d(tx, ty, seedBase);
+    const float tau = 6.2831853;
+    const float ga = 2.39996323;
+    float rotSky = bnCh(tx, ty, 3) * tau;
+    float rotGi = bnCh(tx, ty, 1) * tau;
+    float rotSun = bnCh(tx, ty, 2) * tau;
+    float ndl = dot(nrm, sunDirTo);
+    float ndlW = smoothPosRT(ndl + wrapTerm, smoothEps) * diffScale;
+    float sunSum = 0, sunSumSq = 0;
+    if (ndlW > 1e-4 && sunRays > 0 && hasSun) {
+        for (uint i = 0; i < sunRays; ++i) {
+            float a = rotSun + ga * float(i);
+            float r = sqrt((float(i) + 0.5) / float(sunRays)) * sunRadius;
+            vec3 dir = normalize(sunDirTo + sunT1 * (cos(a) * r) + sunT2 * (sin(a) * r));
+            float vis = rayOccluded(sp, dir, aoDist) ? 0.0 : 1.0;
+            sunSum += vis;
+            sunSumSq += vis * vis;
+        }
+    }
+    float sunMean = sunRays > 0 ? sunSum / float(sunRays) : 0.0;
+    float fSun = ndlW * sunMean;
+    float sunVar = (sunRays > 1) ? max((sunSumSq - sunMean * sunMean * float(sunRays)) / float(sunRays - 1), 0.0) : 0.0;
+    float varSun = ndlW * ndlW * sunVar;
+    vec3 nt1, nt2;
+    tangentBasis(nrm, nt1, nt2);
+    float skySum = 0, skySumSq = 0;
+    vec3 skyAcc = vec3(0);
+    for (uint si = 0; si < aoRays; ++si) {
+        float a = rotSky + ga * float(si);
+        float rr = sqrt((float(si) + 0.5) / float(aoRays));
+        float z = sqrt(max(0.0, 1.0 - rr * rr));
+        vec3 dir = normalize(nt1 * (cos(a) * rr) + nt2 * (sin(a) * rr) + nrm * z);
+        Hit h;
+        float vis;
+        if (traceAny(sp, dir, aoDist, h)) {
+            float nd = h.t / aoDist;
+            float occ = (1.0 - nd) * (1.0 - nd);
+            vis = 1.0 - occ;
+            if (finalMode) skyAcc += skyColorForDir(dir, neut) * vis;
+        } else {
+            vis = 1.0;
+            if (finalMode) skyAcc += skyColorForDir(dir, neut);
+        }
+        skySum += vis;
+        skySumSq += vis * vis;
+    }
+    float fSky = aoRays > 0 ? skySum / float(aoRays) : 0.0;
+    float varVis = (aoRays > 1) ? max((skySumSq - fSky * fSky * float(aoRays)) / float(aoRays - 1), 0.0) : 0.0;
+    if (finalMode && aoRays > 0) skyAcc *= skyLevel / float(aoRays);
+    float varSky = varVis * skyLevel * skyLevel;
+    float giSum = 0, giSumSq = 0;
+    float gsAcc = 0, gkAcc = 0;
+    vec3 giColAcc = vec3(0);
+    uint giHits = 0;
+    for (uint gi2 = 0; gi2 < giRays; ++gi2) {
+        float a = rotGi + ga * float(gi2);
+        float rr = sqrt((float(gi2) + 0.5) / float(giRays));
+        float z = sqrt(max(0.0, 1.0 - rr * rr));
+        vec3 dir = normalize(nt1 * (cos(a) * rr) + nt2 * (sin(a) * rr) + nrm * z);
+        Hit h;
+        if (!traceAny(sp, dir, 250.0, h)) continue;
+        ++giHits;
+        vec3 hn = loadVec3FromTris(h.tri * TRI_BYTES + 36);
+        if (dot(hn, dir) > 0.0) hn = -hn;
+        vec3 hp = sp + dir * h.t + hn * bias;
+        vec3 alb;
+        albedoAt(h, alb);
+        if (giMaxAlbedo > 0.0) {
+            float l = lum3(alb);
+            if (l > giMaxAlbedo) alb *= giMaxAlbedo / l;
+        }
+        if (giDesat > 0.0) {
+            float l = lum3(alb);
+            float k = min(1.0, giDesat);
+            alb += (vec3(l) - alb) * k;
+        }
+        float albLum = lum3(alb);
+        float hSun = 0.0;
+        {
+            float hndl = dot(hn, sunDirTo);
+            float hw = smoothPosRT(hndl + wrapTerm, smoothEps) * diffScale;
+            if (hw > 1e-4 && hasSun) {
+                float ja = halton01(rng, 2) * tau;
+                float jr = sqrt(halton01(rng, 3)) * sunRadius;
+                vec3 sd = normalize(sunDirTo + sunT1 * (cos(ja) * jr) + sunT2 * (sin(ja) * jr));
+                if (!rayOccluded(hp, sd, aoDist)) hSun = hw;
+            }
+        }
+        float hSky = 0.0;
+        {
+            vec3 ht1, ht2;
+            tangentBasis(hn, ht1, ht2);
+            float hrot = halton01(rng, 2) * tau;
+            uint open = 0;
+            for (uint k = 0; k < giNee; ++k) {
+                float ka = hrot + ga * float(k);
+                float kr = sqrt((float(k) + 0.5) / float(giNee));
+                float kz = sqrt(max(0.0, 1.0 - kr * kr));
+                vec3 d = normalize(ht1 * (cos(ka) * kr) + ht2 * (sin(ka) * kr) + hn * kz);
+                if (!rayOccluded(hp, d, aoDist)) ++open;
+            }
+            hSky = giNee > 0 ? float(open) / float(giNee) : 0.0;
+        }
+        gsAcc += albLum * hSun;
+        gkAcc += albLum * hSky;
+        float contrib = albLum * (hSun + hSky);
+        giSum += contrib;
+        giSumSq += contrib * contrib;
+        if (finalMode) {
+            vec3 hitDirect = sunCol * hSun + skyAvgCol * (hSky * skyLevel);
+            giColAcc += alb * hitDirect;
+        }
+    }
+    float invDone = giRays > 0 ? 1.0 / float(giRays) : 0.0;
+    float giSunV = min(gsAcc * invDone, 1.0);
+    float giSkyV = min(gkAcc * invDone, 1.0);
+    vec3 giCol = giColAcc * invDone;
+    float varGi = 0.0;
+    if (giHits > 1) {
+        float vm = giSum / float(giHits);
+        varGi = max((giSumSq - vm * vm * float(giHits)) / float(giHits - 1), 0.0);
+    }
+    vec3 statCol = vec3(0);
+    for (uint li = 0; li < lightCount; ++li) {
+        uint lb = li * 8;
+        vec3 lpos = loadVec3FromLights(lb * 4);
+        vec3 lcol = loadVec3FromLights(lb * 4 + 12);
+        float rangeSq = uintBitsToFloat(g_lights[lb + 6]);
+        float invRangeSq = uintBitsToFloat(g_lights[lb + 7]);
+        vec3 toL = lpos - sp;
+        float dSq = dot(toL, toL);
+        if (dSq > rangeSq || dSq < 1e-6) continue;
+        float dist = sqrt(dSq);
+        toL /= dist;
+        if (dot(toL, nrm) <= 0.0) continue;
+        if (rayOccluded(sp, toL, dist - bias)) continue;
+        float atten = 1.0 / (1.0 + dSq * invRangeSq);
+        statCol += lcol * atten;
+    }
+    if (emiCount > 0 && emiArea > 1e-8 && emSamp > 0) {
+        float invSamples = 1.0 / float(emSamp);
+        for (uint s = 0; s < emSamp; ++s) {
+            float pick = halton01(rng, 2) * emiArea;
+            uint ei = 0;
+            for (; ei + 1 < emiCount; ++ei) {
+                pick -= uintBitsToFloat(g_emi[ei * 16 + 12]);
+                if (pick <= 0.0) break;
+            }
+            uint eb = ei * 16;
+            vec3 tv0 = loadVec3FromEmi(eb * 4);
+            vec3 te1 = loadVec3FromEmi(eb * 4 + 12);
+            vec3 te2 = loadVec3FromEmi(eb * 4 + 24);
+            vec3 tn = loadVec3FromEmi(eb * 4 + 36);
+            vec3 tc = loadVec3FromEmi(eb * 4 + 52);
+            float r1 = halton01(rng, 2), r2 = halton01(rng, 3);
+            float sv = sqrt(r1) * (1.0 - r2);
+            float sw = sqrt(r1) * r2;
+            vec3 p = tv0 + te1 * sv + te2 * sw;
+            vec3 d = p - sp;
+            float distSq = dot(d, d);
+            float dist = sqrt(max(distSq, 1e-6));
+            if (dist <= bias + 1e-3) continue;
+            d /= dist;
+            float cosR = dot(nrm, d);
+            if (cosR <= 0.0) continue;
+            float cosE = abs(dot(tn, d));
+            if (cosE <= 0.0) continue;
+            if (rayOccluded(sp, d, dist - bias)) continue;
+            float effSq = max(distSq, 0.04);
+            float kk = cosR * cosE * emiArea * invSamples / effSq;
+            statCol += tc * kk;
+        }
+    }
+    float statLuma = lum3(statCol);
+    vec3 den;
+    if (finalMode) den = sunCol * fSun + skyAcc + giCol * giGain + statCol;
+    else den = vec3(fSun + giSunV * giGain, fSky + giSkyV * giGain, statLuma);
+    float varL;
+    if (finalMode) {
+        float ls = lum3(sunCol);
+        float lg = lum3(skyAvgCol) * skyLevel * giGain;
+        varL = ls * ls * varSun + lg * lg * varSky + giGain * giGain * varGi;
+    } else {
+        float s0 = sqrt(varSun + giGain * giGain * varGi);
+        float s1 = sqrt(varSky + giGain * giGain * varGi);
+        varL = 0.2126 * 0.2126 * s0 * s0 + 0.7152 * 0.7152 * s1 * s1;
+    }
+    storeVec3Den(gid * 12, den);
+    o_var[gid] = floatBitsToUint(varL);
+    o_stl[gid] = floatBitsToUint(statLuma);
+    storeVec3Stc(gid * 12, statCol);
+}

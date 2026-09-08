@@ -5,6 +5,7 @@ import os
 import json
 import hashlib
 import importlib
+import shutil
 import subprocess
 
 Import("env")
@@ -19,15 +20,13 @@ CACHE_VERSION = 3
 CACHE_PATH    = os.path.join(project_dir, ".pio", "pip3d_assetdb.json")
 
 CHUNK_SUFFIX            = "_chunk"
-BUILTIN_ENGINE_MODELS   = {"suzanne", "teapot"}
+BUILTIN_ENGINE_MODELS   = {"suzanne", "teapot", "bunny"}
 BUILTIN_ENGINE_TEXTURES = {"barrier", "concrete", "gravel", "sun", "tile", "missing"}
 
 GEN_DEPS = {
-    "models":   [],
     "textures": ["PIL"],
     "sun":      ["PIL", "numpy"],
     "sky":      ["numpy", "PIL"],
-    "missing":  [],
     "audio":    ["numpy", "miniaudio"],
 }
 
@@ -46,7 +45,12 @@ def ensure_pip_packages(modules):
     if not missing:
         return
     print(_tag(ANSI_YELLOW, f"Installing Python dependencies: {', '.join(missing)}"))
-    subprocess.check_call([env.subst("$PYTHONEXE"), "-m", "pip", "install"] + missing)
+    try:
+        subprocess.check_call([env.subst("$PYTHONEXE"), "-m", "pip", "install"] + missing)
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise SystemExit(
+            _tag(ANSI_YELLOW, f"pip install failed ({e}). "
+                              f"Install manually: pip install {' '.join(missing)}"))
     for mod in missing:
         importlib.import_module(mod)
 
@@ -80,7 +84,7 @@ def file_hash(path, chunk=1 << 16):
 
 def load_cache():
     try:
-        with open(CACHE_PATH, "r", encoding="utf-8") as f:
+        with open(CACHE_PATH, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         if data.get("version") != CACHE_VERSION:
             return {}, {}
@@ -224,7 +228,7 @@ def asset_mark_built(key, fingerprint, output_path):
 
 
 models_dir        = os.path.join(project_dir, "Tools", "Models")
-obj_sources_dir   = os.path.join(models_dir, "Sources")
+obj_sources_dir   = os.path.join(models_dir, "Asset")
 models_convert_py = os.path.join(models_dir, "Convert.py")
 
 engine_models_dir = os.path.join(project_dir, "lib", "Pip3D", "Pip3D", "Geometry", "Models")
@@ -271,7 +275,7 @@ if os.path.isdir(engine_models_dir):
     for existing in os.listdir(engine_models_dir):
         if existing.lower().endswith(".hpp"):
             base_name = os.path.splitext(existing)[0].lower()
-            if base_name not in BUILTIN_ENGINE_MODELS or existing not in expected_engine_models:
+            if base_name not in BUILTIN_ENGINE_MODELS:
                 stale_path = os.path.join(engine_models_dir, existing)
                 try:
                     os.remove(stale_path)
@@ -291,7 +295,7 @@ if os.path.isdir(app_models_dir):
 
 
 textures_dir       = os.path.join(project_dir, "Tools", "Textures")
-tex_sources_dir    = os.path.join(textures_dir, "Sources")
+tex_sources_dir    = os.path.join(textures_dir, "Asset")
 textures_convert_py = os.path.join(textures_dir, "Convert.py")
 
 engine_textures_dir   = os.path.join(project_dir, "lib", "Pip3D", "Pip3D", "Rendering", "Resources", "Textures")
@@ -407,7 +411,7 @@ if os.path.isfile(skygen_path):
 
 
 audio_dir          = os.path.join(project_dir, "Tools", "Audio")
-audio_sources_dir  = os.path.join(audio_dir, "Sources")
+audio_sources_dir  = os.path.join(audio_dir, "Asset")
 audio_convert_py   = os.path.join(audio_dir, "Convert.py")
 sounds_output_dir  = os.path.join(project_dir, "lib", "Pip3D", "Pip3D", "Audio", "Sounds")
 
@@ -460,9 +464,81 @@ if os.path.isdir(sounds_output_dir):
             except OSError:
                 pass
 
-stale_keys = [k for k in CACHE if k not in LIVE_KEYS]
+stale_keys = [k for k in CACHE if k not in LIVE_KEYS and not k.startswith("bake:")]
 for k in stale_keys:
     del CACHE[k]
 
 if CACHE_CHANGED or stale_keys:
     save_cache(CACHE)
+
+def _is_bake_up_to_date():
+    try:
+        bake_cache = os.path.join(project_dir, "Tools", "Bake", "Build", "bake_cache.json")
+        scene = (os.environ.get("PIP3D_BAKE_SCENE") or "Scene").strip() or "Scene"
+        baked = os.path.join(project_dir, "src", "Lighting", f"Baked{scene}.hpp")
+        if scene == "Scene" and not os.path.exists(baked):
+            baked = os.path.join(project_dir, "src", "Lighting", "BakedScene.hpp")
+        if not os.path.exists(baked) or not os.path.exists(bake_cache):
+            return False
+        try:
+            baked_mtime = os.path.getmtime(baked)
+            cache_mtime = os.path.getmtime(bake_cache)
+            newest_input = 0
+            bases = [os.path.join(project_dir, "Tools", "Bake", "Source"),
+                     os.path.join(project_dir, "src"),
+                     os.path.join(project_dir, "lib", "Pip3D")]
+            for base in bases:
+                if not os.path.isdir(base):
+                    continue
+                for r, _, fs in os.walk(base):
+                    for fn in fs:
+                        fp = os.path.join(r, fn)
+                        if fn.startswith("Baked") and os.path.basename(r) == "Lighting":
+                            continue
+                        try:
+                            mt = os.path.getmtime(fp)
+                            if mt > newest_input:
+                                newest_input = mt
+                        except OSError:
+                            pass
+            try:
+                mt = os.path.getmtime(os.path.join(project_dir, "Tools", "Bake", "Bake.ps1"))
+                if mt > newest_input:
+                    newest_input = mt
+            except OSError:
+                pass
+            if newest_input > baked_mtime or newest_input > cache_mtime:
+                return False
+        except OSError:
+            return False
+        try:
+            j = json.load(open(bake_cache, "r", encoding="utf-8-sig"))
+            if j.get("version") != 1 or not j.get("fingerprint"):
+                return False
+            oh = file_hash(baked)
+            if not oh or j.get("output_hash") != oh:
+                return False
+        except Exception:
+            return False
+        return True
+    except Exception:
+        return False
+
+try:
+    bake_src_dir = os.path.join(project_dir, "Tools", "Bake", "Source")
+    bake_ps1 = os.path.join(project_dir, "Tools", "Bake", "Bake.ps1")
+    if os.path.isdir(bake_src_dir) and os.path.isfile(bake_ps1) and os.path.isfile(os.path.join(project_dir, "src", "main.cpp")):
+        if _is_bake_up_to_date():
+            print(_tag(ANSI_YELLOW, "Bake up-to-date — skipping Bake.ps1 (use -Clean to force)"))
+        else:
+            _pwsh = shutil.which("powershell") or shutil.which("pwsh")
+            if _pwsh:
+                print(_tag(ANSI_GREEN, "Triggering Bake.ps1 ..."))
+                try:
+                    subprocess.check_call([_pwsh, "-ExecutionPolicy", "Bypass", "-File", bake_ps1], env=dict(os.environ))
+                except subprocess.CalledProcessError as e:
+                    print(_tag(ANSI_YELLOW, f"Bake.ps1 failed with code {e.returncode}"))
+            else:
+                print(_tag(ANSI_YELLOW, "Powershell not found, skipping Bake.ps1"))
+except Exception as _ex:
+    print(_tag(ANSI_YELLOW, f"Bake trigger error: {_ex}"))

@@ -233,7 +233,7 @@ def main():
     alpha_plane, shade_plane = gen_cloud_mask(args.coverage, args.seed)
 
     script_dir   = os.path.dirname(os.path.abspath(__file__))
-    sources_dir  = os.path.join(script_dir, "Sources")
+    sources_dir  = os.path.join(script_dir, "Asset")
     os.makedirs(sources_dir, exist_ok=True)
     preview_path = os.path.join(sources_dir, PREVIEW_FILENAME)
     Image.fromarray(mask_to_preview(alpha_plane, shade_plane, cloud_rgb), "RGB").save(preview_path)

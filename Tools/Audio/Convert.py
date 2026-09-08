@@ -21,12 +21,9 @@ try:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    HAS_VIZ = True
 except ImportError:
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "matplotlib"])
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    HAS_VIZ = False
 
 
 INDEX_TABLE = [
@@ -590,6 +587,8 @@ def export_hpp(clean_name, payload, info, src_channels, src_rate, output_hpp_pat
 
 
 def export_visualisation(clean_name, info, src_channels, src_rate, output_png_path):
+    if not HAS_VIZ:
+        return False
     from matplotlib.patches import Patch
 
     os.makedirs(os.path.dirname(output_png_path), exist_ok=True)
@@ -725,6 +724,10 @@ def convert_one(input_path, output_path, force_source_rate=None, no_viz=False):
           f"4bit={info['mode_stats'].get(2,0)} 6bit={info['mode_stats'].get(3,0)} hold={info['mode_stats'].get(4,0)}")
 
     if no_viz:
+        return
+
+    if not HAS_VIZ:
+        print("       Visualisation skipped (matplotlib not installed)")
         return
 
     hpp_abs = os.path.abspath(output_path)

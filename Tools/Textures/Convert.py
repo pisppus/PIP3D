@@ -249,7 +249,7 @@ def convert_png2tex(img_path, force_output_path=None, target_size=None, no_mip=F
             out.write(f"        .mipCount = {mip_count}\n")
             out.write("    };\n}\n")
 
-        rel_img = os.path.join("Textures", "Sources", os.path.basename(img_path)).replace("\\", "/")
+        rel_img = os.path.join("Textures", "Asset", os.path.basename(img_path)).replace("\\", "/")
         rel_hpp = os.path.join("Rendering", "Resources", "Textures", os.path.basename(header_path)).replace("\\", "/")
         print(_tag(f"Converting: {rel_img} -> {rel_hpp} ({width}x{height} {'square' if is_square else 'non-square'} POT, {base_bytes / 1024.0:.2f} KB + {mip_count} mips = {mip_bytes / 1024.0:.2f} KB, {total_bytes / 1024.0:.2f} KB total)"))
         if max(width, height) >= 256:
